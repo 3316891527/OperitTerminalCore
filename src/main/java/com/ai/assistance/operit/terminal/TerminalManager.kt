@@ -718,12 +718,13 @@ class TerminalManager private constructor(
             Log.e(TAG, "Failed to remove stale libtalloc link", e)
         }
 
-        // Symlink other binaries
+        // `libsudo.so` is not shipped as a real Android ELF in this module. Keep
+        // the optional command out of the link set until a native implementation
+        // is provided, so a placeholder file cannot be packaged or linked.
         val libraries = mapOf(
             "liboperit_proot.so" to "proot",
             "liboperit_loader.so" to "loader",
-            "libbash.so" to "bash",
-            "libsudo.so" to "sudo"
+            "libbash.so" to "bash"
         )
 
         libraries.forEach { (libName, linkName) ->
