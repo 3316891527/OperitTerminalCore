@@ -98,6 +98,7 @@ fun SettingsScreen(
     
     // 共享tmp设置状态
     val sharedTmpEnabled by viewModel.sharedTmpEnabled.collectAsState()
+    val harmonyProotCompatEnabled by viewModel.harmonyProotCompatEnabled.collectAsState()
     
     val chrootEnabled by viewModel.chrootEnabled.collectAsState()
     val chrootMountStatus by viewModel.chrootMountStatus.collectAsState()
@@ -501,6 +502,59 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = context.getString(com.ai.assistance.operit.terminal.R.string.shared_tmp_note),
+                        fontSize = 12.sp,
+                        color = SettingsTheme.onSurfaceVariant.copy(alpha = 0.8f),
+                        lineHeight = 16.sp
+                    )
+                }
+            }
+
+            // HarmonyOS NEXT / 卓易通 proot 兼容设置
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                colors = CardDefaults.cardColors(containerColor = SettingsTheme.surfaceColor)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = context.getString(com.ai.assistance.operit.terminal.R.string.harmony_proot_compat_title),
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = SettingsTheme.onSurfaceColor
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = if (harmonyProotCompatEnabled) {
+                                    context.getString(com.ai.assistance.operit.terminal.R.string.harmony_proot_compat_enabled_desc)
+                                } else {
+                                    context.getString(com.ai.assistance.operit.terminal.R.string.harmony_proot_compat_disabled_desc)
+                                },
+                                fontSize = 14.sp,
+                                color = SettingsTheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = harmonyProotCompatEnabled,
+                            onCheckedChange = { enabled ->
+                                viewModel.setHarmonyProotCompatEnabled(enabled)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = SettingsTheme.primaryColor,
+                                checkedTrackColor = SettingsTheme.primaryColor.copy(alpha = 0.5f)
+                            )
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = context.getString(com.ai.assistance.operit.terminal.R.string.harmony_proot_compat_note),
                         fontSize = 12.sp,
                         color = SettingsTheme.onSurfaceVariant.copy(alpha = 0.8f),
                         lineHeight = 16.sp

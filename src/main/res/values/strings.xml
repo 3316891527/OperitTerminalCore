@@ -149,6 +149,11 @@
     <string name="shared_tmp_disabled_desc">已禁用 - Ubuntu 使用独立的 /tmp 目录</string>
     <string name="shared_tmp_note">注意：某些设备可能在共享模式下出现兼容性问题，如遇错误可尝试禁用此选项</string>
 
+    <string name="harmony_proot_compat_title">鸿蒙 proot 兼容模式</string>
+    <string name="harmony_proot_compat_enabled_desc">已启用 - 为本地 proot 禁用 seccomp 加速</string>
+    <string name="harmony_proot_compat_disabled_desc">已禁用 - 使用默认 proot seccomp 模式</string>
+    <string name="harmony_proot_compat_note">仅用于 HarmonyOS NEXT / 卓易通环境中出现 Function not implemented、无法切换目录或无法执行脚本等问题的设备。开启可能降低 proot 性能，重启应用后生效</string>
+
     <string name="chroot_mode_title">chroot 模式</string>
     <string name="chroot_mode_enabled_desc">已启用 - 使用 chroot 启动 Ubuntu（需要 Root）</string>
     <string name="chroot_mode_disabled_desc">已禁用 - 使用 proot 启动 Ubuntu</string>

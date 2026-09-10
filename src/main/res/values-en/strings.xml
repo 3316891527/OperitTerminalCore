@@ -149,6 +149,11 @@
     <string name="shared_tmp_disabled_desc">Disabled - Ubuntu uses separate /tmp directory</string>
     <string name="shared_tmp_note">Note: Some devices may experience compatibility issues in shared mode. Try disabling this option if errors occur</string>
 
+    <string name="harmony_proot_compat_title">HarmonyOS proot Compatibility</string>
+    <string name="harmony_proot_compat_enabled_desc">Enabled - Disable seccomp acceleration for local proot</string>
+    <string name="harmony_proot_compat_disabled_desc">Disabled - Use the default proot seccomp mode</string>
+    <string name="harmony_proot_compat_note">Use only when HarmonyOS NEXT / ZhuoyiTong reports Function not implemented, cannot change directories, or cannot run scripts. Enabling this may reduce proot performance. Restart the app to apply</string>
+
     <string name="chroot_mode_title">chroot Mode</string>
     <string name="chroot_mode_enabled_desc">Enabled - Start Ubuntu via chroot (Root required)</string>
     <string name="chroot_mode_disabled_desc">Disabled - Start Ubuntu via proot</string>

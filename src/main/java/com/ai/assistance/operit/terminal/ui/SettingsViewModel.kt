@@ -86,6 +86,9 @@ class SettingsViewModel(
     private val _sharedTmpEnabled = MutableStateFlow(true)
     val sharedTmpEnabled = _sharedTmpEnabled.asStateFlow()
 
+    private val _harmonyProotCompatEnabled = MutableStateFlow(false)
+    val harmonyProotCompatEnabled = _harmonyProotCompatEnabled.asStateFlow()
+
     private val _chrootEnabled = MutableStateFlow(false)
     val chrootEnabled = _chrootEnabled.asStateFlow()
 
@@ -114,6 +117,7 @@ class SettingsViewModel(
         loadSSHConfigs()
         loadSSHEnabled()
         loadSharedTmpSetting()
+        loadHarmonyProotCompatSetting()
         loadChrootSetting()
         loadVirtualKeyboardLayout()
     }
@@ -419,6 +423,15 @@ class SettingsViewModel(
     
     fun isSharedTmpEnabled(): Boolean {
         return prefs.getBoolean("shared_tmp_enabled", true)
+    }
+
+    private fun loadHarmonyProotCompatSetting() {
+        _harmonyProotCompatEnabled.value = prefs.getBoolean("harmony_proot_compat_enabled", false)
+    }
+
+    fun setHarmonyProotCompatEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("harmony_proot_compat_enabled", enabled).apply()
+        _harmonyProotCompatEnabled.value = enabled
     }
 
     private fun loadChrootSetting() {

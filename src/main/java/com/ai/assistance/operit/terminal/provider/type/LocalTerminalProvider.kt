@@ -562,6 +562,10 @@ class LocalTerminalProvider(
         env["TERMUX_PREFIX"] = usrDir.absolutePath
         env["LD_LIBRARY_PATH"] = "${nativeLibDir}:${binDir.absolutePath}"
         env["PROOT_LOADER"] = File(binDir, "loader").absolutePath
+        val prefs = context.getSharedPreferences("terminal_settings", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("harmony_proot_compat_enabled", false)) {
+            env["PROOT_NO_SECCOMP"] = "1"
+        }
         env["TMPDIR"] = File(filesDir, "tmp").absolutePath
         env["PROOT_TMP_DIR"] = File(filesDir, "tmp").absolutePath
         env["TERM"] = "xterm-256color"
