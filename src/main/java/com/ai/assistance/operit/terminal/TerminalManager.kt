@@ -3,6 +3,7 @@ package com.ai.assistance.operit.terminal
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
@@ -118,6 +119,14 @@ class TerminalManager private constructor(
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: TerminalManager(context.applicationContext).also { INSTANCE = it }
             }
+        }
+
+        @Volatile
+        private var ubuntuArchivePreparer: (suspend (Context, File) -> Unit)? = null
+
+        /** 宿主提供并校验 Ubuntu 安装归档，注册过程不创建默认会话。 */
+        fun setUbuntuArchivePreparer(preparer: suspend (Context, File) -> Unit) {
+            ubuntuArchivePreparer = preparer
         }
 
         private const val TAG = "TerminalManager"
@@ -635,6 +644,8 @@ class TerminalManager private constructor(
 
                     Log.d(TAG, "Environment initialization completed successfully.")
                     true
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     Log.e(TAG, "Environment initialization failed", e)
                     false
@@ -781,45 +792,20 @@ class TerminalManager private constructor(
         Files.createSymbolicLink(linkFile.toPath(), targetPath)
     }
 
-    private fun extractAssets() {
-        try {
-            val assets = listOf(
-                UBUNTU_FILENAME,
-                "setup_fake_sysdata.sh"
-            )
-            assets.forEach { assetName ->
-                val assetFile = File(filesDir, assetName)
-                // 强制更新脚本文件，大文件只在不存在时提取
-                val shouldExtract = !assetFile.exists() || assetName == "setup_fake_sysdata.sh"
-
-                if (shouldExtract) {
-                    if (assetName.endsWith(".sh")) {
-                        context.assets.open(assetName).use { input ->
-                            val raw = input.readBytes()
-                            val text = raw.toString(Charsets.UTF_8)
-                            val normalized =
-                                text
-                                    .removePrefix("\uFEFF")
-                                    .replace("\r\n", "\n")
-                                    .replace("\r", "\n")
-                            assetFile.writeText(normalized, Charsets.UTF_8)
-                        }
-                    } else {
-                        context.assets.open(assetName).use { input ->
-                            assetFile.outputStream().use { output ->
-                                input.copyTo(output)
-                            }
-                        }
-                    }
-                    Log.d(TAG, "Extracted $assetName")
-                } else {
-                    Log.d(TAG, "Asset $assetName already exists.")
-                }
-            }
-        } catch (e: IOException) {
-            Log.e(TAG, "Failed to extract assets", e)
-            throw e
+    private suspend fun extractAssets() {
+        val rootfs = File(filesDir, "usr/var/lib/proot-distro/installed-rootfs/ubuntu")
+        val installed = File(rootfs, ".operit_installed_ok").isFile || File(rootfs, "etc/issue.net").isFile
+        if (!installed) {
+            val preparer = checkNotNull(ubuntuArchivePreparer) { "Ubuntu archive preparer is not registered" }
+            preparer(context, File(filesDir, UBUNTU_FILENAME))
         }
+
+        // 每次更新小型脚本；大型安装归档由宿主校验后提供。
+        val script = context.assets.open("setup_fake_sysdata.sh").bufferedReader(Charsets.UTF_8).use { it.readText() }
+        File(filesDir, "setup_fake_sysdata.sh").writeText(
+            script.removePrefix("\uFEFF").replace("\r\n", "\n").replace("\r", "\n"),
+            Charsets.UTF_8,
+        )
     }
 
     private fun generateStartScript(): String {
