@@ -27,4 +27,8 @@ The `terminal-core` module is responsible for the following core tasks:
 
 ## Usage
 
-This module can be integrated as a Git Submodule. The client application can either bind to the `TerminalService` for background operation and IPC, or directly access the `TerminalManager` singleton if running in the same process. Refer to the main project's `README.md` for a detailed example of the AIDL interface. 
+This module can be integrated as a Git Submodule. The client application can either bind to the `TerminalService` for background operation and IPC, or directly access the `TerminalManager` singleton if running in the same process. Refer to the main project's `README.md` for a detailed example of the AIDL interface.
+
+## 独立发行整合
+
+[终端核心来源与协同行为](docs/distribution_integration.md) 记录独立发行分支所包含的修复及验证范围。
