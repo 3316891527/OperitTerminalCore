@@ -109,9 +109,8 @@ class LocalTerminalProvider(
     }
 
     override suspend fun closeSession(sessionId: String) {
-        activeSessions[sessionId]?.let { session ->
-            session.process.destroy()
-            activeSessions.remove(sessionId)
+        activeSessions.remove(sessionId)?.let { session ->
+            destroyProcessTree(session.process)
             Log.d(TAG, "Closed local terminal session: $sessionId")
         }
     }
@@ -485,17 +484,51 @@ class LocalTerminalProvider(
     }
 
     private suspend fun closeHiddenExecShell(shell: HiddenExecShell) {
+        // 按实例移除缓存，避免误删同键的新会话，同时回收旧会话的整个进程组。
         hiddenExecShells.remove(shell.key, shell)
         withContext(Dispatchers.IO) {
             runCatching { shell.writer.close() }
-            runCatching { shell.process.destroy() }
-            if (shell.process.isAlive) {
-                runCatching { shell.process.destroyForcibly() }
-            }
+            destroyProcessTree(shell.process)
             runCatching { shell.readJob.cancel() }
             runCatching { shell.outputChannel.close() }
         }
         Log.d(TAG, "Closed hidden exec shell: ${shell.key}")
+    }
+
+    private fun destroyProcessTree(process: Process) {
+        val pid = pidOf(process)
+        if (pid != null && pid > 0) {
+            runCatching { Os.kill((-pid).toInt(), OsConstants.SIGTERM) }
+            try {
+                Thread.sleep(80)
+            } catch (_: InterruptedException) {
+            }
+            runCatching { Os.kill((-pid).toInt(), OsConstants.SIGKILL) }
+        }
+        runCatching { process.destroy() }
+        // 保留超时回收的强制终止行为，关闭流程不再无限等待进程退出。
+        if (process.isAlive) {
+            runCatching { process.destroyForcibly() }
+        }
+    }
+
+    private fun pidOf(process: Process): Long? {
+        return runCatching {
+            val method = Process::class.java.getMethod("pid")
+            when (val value = method.invoke(process)) {
+                is Long -> value
+                is Int -> value.toLong()
+                else -> null
+            }
+        }.getOrNull() ?: runCatching {
+            val field = process.javaClass.getDeclaredField("pid")
+            field.isAccessible = true
+            when (val value = field.get(process)) {
+                is Int -> value.toLong()
+                is Long -> value
+                else -> null
+            }
+        }.getOrNull()
     }
 
     private fun buildVisibleSessionCommand(): Array<String> {
