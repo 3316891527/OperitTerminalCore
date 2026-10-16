@@ -52,6 +52,7 @@ class TerminalManager private constructor(
     internal val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val commandEventChannel = Channel<CommandExecutionEvent>(Channel.UNLIMITED)
     private val envInitMutex = Mutex()
+    private val sessionStartMutex = Mutex()
     private var isEnvInitialized = false
 
     private val filesDir: File = context.filesDir
@@ -115,9 +116,44 @@ class TerminalManager private constructor(
         @Volatile
         private var INSTANCE: TerminalManager? = null
 
+        private val environmentMaintenanceMutex = Mutex()
+        @Volatile
+        private var environmentMaintenanceInProgress = false
+
         fun getInstance(context: Context): TerminalManager {
             return INSTANCE ?: synchronized(this) {
+                check(!environmentMaintenanceInProgress) { "Terminal environment maintenance is in progress" }
                 INSTANCE ?: TerminalManager(context.applicationContext).also { INSTANCE = it }
+            }
+        }
+
+        /** 停止会话并重置初始化状态，宿主在此期间删除终端环境及安装资源。 */
+        suspend fun withEnvironmentMaintenance(operation: suspend () -> Unit) {
+            environmentMaintenanceMutex.withLock {
+                val manager = synchronized(this) {
+                    environmentMaintenanceInProgress = true
+                    INSTANCE
+                }
+                try {
+                    // 删除开始后完整执行，避免退出资源页面留下半删除的系统。
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                        if (manager == null) {
+                            operation()
+                        } else {
+                            manager.envInitMutex.withLock {
+                                manager.sessionStartMutex.withLock {
+                                    manager.providerMutex.withLock {
+                                        manager.prepareForMaintenance()
+                                    }
+                                    manager.isEnvInitialized = false
+                                    operation()
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    environmentMaintenanceInProgress = false
+                }
             }
         }
 
@@ -181,7 +217,10 @@ class TerminalManager private constructor(
             TerminalType.LOCAL
         }
         
-        val newSession = sessionManager.createNewSession(title, terminalType)
+        val newSession = synchronized(Companion) {
+            check(!environmentMaintenanceInProgress) { "Terminal environment maintenance is in progress" }
+            sessionManager.createNewSession(title, terminalType)
+        }
 
         // 异步初始化会话
         coroutineScope.launch {
@@ -488,8 +527,9 @@ class TerminalManager private constructor(
 
     private fun initializeSession(sessionId: String) {
         coroutineScope.launch {
+            if (sessionManager.getSession(sessionId) == null) return@launch
             val success = initializeEnvironment()
-            if (success) {
+            if (success && sessionManager.getSession(sessionId) != null) {
                 startSession(sessionId)
             }
         }
@@ -497,57 +537,60 @@ class TerminalManager private constructor(
 
     private fun startSession(sessionId: String) {
         coroutineScope.launch(Dispatchers.IO) {
-            try {
-                Log.d(TAG, "Starting session...")
-                closingSessions.remove(sessionId)
+            sessionStartMutex.withLock {
+                if (environmentMaintenanceInProgress || sessionManager.getSession(sessionId) == null) return@withLock
+                try {
+                    Log.d(TAG, "Starting session...")
+                    closingSessions.remove(sessionId)
 
-                // 获取单例的终端提供者
-                val provider = getTerminalProvider()
+                    // 获取单例的终端提供者
+                    val provider = getTerminalProvider()
 
-                // 启动终端会话
-                val result = provider.startSession(sessionId)
-                val (terminalSession, pty) = result.getOrThrow()
-                val sessionWriter = terminalSession.stdin.writer()
+                    // 启动终端会话
+                    val result = provider.startSession(sessionId)
+                    val (terminalSession, pty) = result.getOrThrow()
+                    val sessionWriter = terminalSession.stdin.writer()
 
-                // 启动读取协程
-                val readJob = launch {
-                    var reachedEof = false
-                    try {
-                        terminalSession.stdout.use { inputStream ->
-                            val buffer = ByteArray(4096)
-                            var bytesRead: Int
-                            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                                val chunk = String(buffer, 0, bytesRead)
-                                Log.d(TAG, "Read chunk: '$chunk'")
-                                outputProcessor.processOutput(sessionId, chunk, sessionManager)
+                    // 启动读取协程
+                    val readJob = launch {
+                        var reachedEof = false
+                        try {
+                            terminalSession.stdout.use { inputStream ->
+                                val buffer = ByteArray(4096)
+                                var bytesRead: Int
+                                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                                    val chunk = String(buffer, 0, bytesRead)
+                                    Log.d(TAG, "Read chunk: '$chunk'")
+                                    outputProcessor.processOutput(sessionId, chunk, sessionManager)
+                                }
+                                reachedEof = true
                             }
-                            reachedEof = true
-                        }
-                    } catch (e: java.io.InterruptedIOException) {
-                        Log.i(TAG, "Read job interrupted for session $sessionId.")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error in read job for session $sessionId", e)
-                    } finally {
-                        if (closingSessions.remove(sessionId)) {
-                            return@launch
-                        }
-                        if (reachedEof || !terminalSession.process.isAlive) {
-                            handleTerminalSessionExit(sessionId, terminalSession)
+                        } catch (e: java.io.InterruptedIOException) {
+                            Log.i(TAG, "Read job interrupted for session $sessionId.")
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error in read job for session $sessionId", e)
+                        } finally {
+                            if (closingSessions.remove(sessionId)) {
+                                return@launch
+                            }
+                            if (reachedEof || !terminalSession.process.isAlive) {
+                                handleTerminalSessionExit(sessionId, terminalSession)
+                            }
                         }
                     }
-                }
 
-                // 更新会话信息
-                sessionManager.updateSession(sessionId) { session ->
-                    session.copy(
-                        terminalSession = terminalSession,
-                        pty = pty,
-                        sessionWriter = sessionWriter,
-                        readJob = readJob
-                    )
+                    // 更新会话信息
+                    sessionManager.updateSession(sessionId) { session ->
+                        session.copy(
+                            terminalSession = terminalSession,
+                            pty = pty,
+                            sessionWriter = sessionWriter,
+                            readJob = readJob
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error starting session", e)
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error starting session", e)
             }
         }
     }
@@ -587,6 +630,7 @@ class TerminalManager private constructor(
      */
     private suspend fun getTerminalProvider(): TerminalProvider {
         providerMutex.withLock {
+            check(!environmentMaintenanceInProgress) { "Terminal environment maintenance is in progress" }
             if (terminalProvider == null) {
                 val sshConfig = sshConfigManager.getConfig()
                 val provider = if (sshConfig != null && sshConfigManager.isEnabled()) {
@@ -599,64 +643,32 @@ class TerminalManager private constructor(
                 provider.connect().getOrThrow()
                 terminalProvider = provider
             }
+            return terminalProvider!!
         }
-        return terminalProvider!!
     }
 
-    suspend fun initializeEnvironment(): Boolean {
-        if (isEnvInitialized) {
-            return withContext(Dispatchers.IO) {
-                try {
-                    val startScript = generateStartScript()
-                    File(filesDir, "common.sh").writeText(startScript.replace("\r\n", "\n").replace("\r", "\n"))
-                    true
-                } catch (e: Exception) {
-                    Log.e(TAG, "Environment script refresh failed", e)
-                    false
-                }
-            }
-        }
-
-        envInitMutex.lock()
-        try {
-            if (isEnvInitialized) {
-                return true
-            }
-
-            val success = withContext(Dispatchers.IO) {
-                try {
+    suspend fun initializeEnvironment(): Boolean = envInitMutex.withLock {
+        if (environmentMaintenanceInProgress) return@withLock false
+        withContext(Dispatchers.IO) {
+            try {
+                if (!isEnvInitialized) {
                     Log.d(TAG, "Starting environment initialization...")
-
-                    // 1. Create necessary directories
                     createDirectories()
-
-                    // 2. Link native libraries
                     linkNativeLibs()
                     createBusyboxSymlinks()
-
-                    // 3. Extract assets
                     extractAssets()
-
-                    // 4. Generate and write startup script
-                    val startScript = generateStartScript()
-                    File(filesDir, "common.sh").writeText(startScript.replace("\r\n", "\n").replace("\r", "\n"))
-
-
-                    Log.d(TAG, "Environment initialization completed successfully.")
-                    true
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.e(TAG, "Environment initialization failed", e)
-                    false
                 }
-            }
-            if (success) {
+                val startScript = generateStartScript()
+                File(filesDir, "common.sh").writeText(startScript.replace("\r\n", "\n").replace("\r", "\n"))
                 isEnvInitialized = true
+                Log.d(TAG, "Environment initialization completed successfully.")
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Environment initialization failed", e)
+                false
             }
-            return success
-        } finally {
-            envInitMutex.unlock()
         }
     }
 

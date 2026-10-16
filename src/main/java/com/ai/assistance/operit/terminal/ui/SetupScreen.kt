@@ -344,12 +344,10 @@ fun SetupScreen(
                 onClick = {
                     val commands = mutableListOf<String>()
                     
-                    // 系统修复（串行）
+                    // 先刷新索引并补齐依赖，避免 dpkg 提前失败导致后续修复命令被 && 跳过。
+                    commands.add("apt-get update")
+                    commands.add("apt-get --fix-broken install -y")
                     commands.add("dpkg --configure -a")
-                    commands.add("apt install -f -y")
-
-                    // 更新软件源
-                    commands.add("apt update -y")
 
                     // 系统升级
                     commands.add("apt upgrade -y")
