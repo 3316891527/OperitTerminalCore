@@ -18,8 +18,13 @@ TerminalManager.setUbuntuArchivePreparer { context, destination ->
 
 ## 删除与重新安装
 
-宿主删除已安装的 Ubuntu 和安装归档时，调用 `TerminalManager.withEnvironmentMaintenance { ... }`，在回调中删除应用私有目录中的环境及资源。该操作停止现有终端会话和 SSHD，阻止新的会话启动，并重置初始化状态；未创建终端管理器时不会为删除操作创建默认会话。删除开始后不响应取消，宿主应显示不可取消的删除进度。
+宿主删除已安装的 Ubuntu 和安装归档时，调用 `TerminalManager.withEnvironmentMaintenance(context) { ... }`，在回调中删除应用私有目录中的环境及资源。该操作停止现有终端会话和 SSHD，阻止新的会话启动，并重置初始化状态；未创建终端管理器时不会为删除操作创建默认会话。删除开始后不响应取消，宿主应显示不可取消的删除进度。
 
 删除完成后，宿主重新读取安装标记及资源校验结果。用户重新导入符合资源校验规则的安装归档后，下次初始化重新调用归档准备接口。
 
 环境配置先执行 `apt-get update` 和 `apt-get --fix-broken install -y`，再执行 `dpkg --configure -a`，避免缺失依赖时首条配置命令失败，导致后续修复被命令链跳过。
+
+
+删除维护接口在删除首个文件前，用 AtomicFile 将待删除记录写入 `terminal-maintenance/ubuntu-removal`，完整成功后才清除记录。记录存在时，`isEnvironmentRemovalPending(context)` 返回 true，初始化、新会话和 provider 获取均阻止使用未清理完的环境。
+
+宿主在主进程启动时调用 `withEnvironmentMaintenance(context, resumeOnly = true) { ... }` 继续清理。恢复请求在维护互斥锁内检查记录，已完成的恢复不会再次执行删除回调。`environmentMaintenanceState` 可用于刷新恢复进度和最终状态。Android 终止进程后删除暂停，下次启动恢复，不承诺进程终止期间持续执行。

@@ -13,6 +13,9 @@ import java.nio.file.Paths
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import com.ai.assistance.operit.terminal.maintenance.UbuntuRemovalJournal
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -119,26 +122,44 @@ class TerminalManager private constructor(
         private val environmentMaintenanceMutex = Mutex()
         @Volatile
         private var environmentMaintenanceInProgress = false
+        private val _environmentMaintenanceState = MutableStateFlow(false)
+        val environmentMaintenanceState: StateFlow<Boolean> = _environmentMaintenanceState.asStateFlow()
+
+        fun isEnvironmentRemovalPending(context: Context): Boolean =
+            UbuntuRemovalJournal(context.filesDir).isPending()
 
         fun getInstance(context: Context): TerminalManager {
             return INSTANCE ?: synchronized(this) {
-                check(!environmentMaintenanceInProgress) { "Terminal environment maintenance is in progress" }
                 INSTANCE ?: TerminalManager(context.applicationContext).also { INSTANCE = it }
             }
         }
 
         /** 停止会话并重置初始化状态，宿主在此期间删除终端环境及安装资源。 */
-        suspend fun withEnvironmentMaintenance(operation: suspend () -> Unit) {
+        suspend fun withEnvironmentMaintenance(
+            context: Context,
+            resumeOnly: Boolean = false,
+            operation: suspend () -> Unit,
+        ) {
             environmentMaintenanceMutex.withLock {
+                val journal = UbuntuRemovalJournal(context.filesDir)
+                // 自动恢复在互斥锁内复查，避免已结束的恢复请求删除后来重新导入的环境。
+                if (resumeOnly && !journal.isPending()) return@withLock
                 val manager = synchronized(this) {
                     environmentMaintenanceInProgress = true
+                    _environmentMaintenanceState.value = true
                     INSTANCE
                 }
                 try {
                     // 删除开始后完整执行，避免退出资源页面留下半删除的系统。
                     withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
-                        if (manager == null) {
+                        val remove: suspend () -> Unit = {
+                            journal.begin()
                             operation()
+                            // 清理失败时保留记录，下次启动继续；只有完整成功才清除。
+                            journal.finish()
+                        }
+                        if (manager == null) {
+                            remove()
                         } else {
                             manager.envInitMutex.withLock {
                                 manager.sessionStartMutex.withLock {
@@ -146,13 +167,14 @@ class TerminalManager private constructor(
                                         manager.prepareForMaintenance()
                                     }
                                     manager.isEnvInitialized = false
-                                    operation()
+                                    remove()
                                 }
                             }
                         }
                     }
                 } finally {
                     environmentMaintenanceInProgress = false
+                    _environmentMaintenanceState.value = false
                 }
             }
         }
@@ -218,7 +240,9 @@ class TerminalManager private constructor(
         }
         
         val newSession = synchronized(Companion) {
-            check(!environmentMaintenanceInProgress) { "Terminal environment maintenance is in progress" }
+            check(!environmentMaintenanceInProgress && !isEnvironmentRemovalPending(context)) {
+                "Ubuntu removal is incomplete; finish cleanup in Offline resources"
+            }
             sessionManager.createNewSession(title, terminalType)
         }
 
@@ -538,7 +562,7 @@ class TerminalManager private constructor(
     private fun startSession(sessionId: String) {
         coroutineScope.launch(Dispatchers.IO) {
             sessionStartMutex.withLock {
-                if (environmentMaintenanceInProgress || sessionManager.getSession(sessionId) == null) return@withLock
+                if (environmentMaintenanceInProgress || isEnvironmentRemovalPending(context) || sessionManager.getSession(sessionId) == null) return@withLock
                 try {
                     Log.d(TAG, "Starting session...")
                     closingSessions.remove(sessionId)
@@ -630,7 +654,9 @@ class TerminalManager private constructor(
      */
     private suspend fun getTerminalProvider(): TerminalProvider {
         providerMutex.withLock {
-            check(!environmentMaintenanceInProgress) { "Terminal environment maintenance is in progress" }
+            check(!environmentMaintenanceInProgress && !isEnvironmentRemovalPending(context)) {
+                "Ubuntu removal is incomplete; finish cleanup in Offline resources"
+            }
             if (terminalProvider == null) {
                 val sshConfig = sshConfigManager.getConfig()
                 val provider = if (sshConfig != null && sshConfigManager.isEnabled()) {
@@ -648,7 +674,7 @@ class TerminalManager private constructor(
     }
 
     suspend fun initializeEnvironment(): Boolean = envInitMutex.withLock {
-        if (environmentMaintenanceInProgress) return@withLock false
+        if (environmentMaintenanceInProgress || isEnvironmentRemovalPending(context)) return@withLock false
         withContext(Dispatchers.IO) {
             try {
                 if (!isEnvInitialized) {
