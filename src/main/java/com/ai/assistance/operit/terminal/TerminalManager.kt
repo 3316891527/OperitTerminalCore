@@ -11,6 +11,7 @@ import java.nio.file.Files
 import kotlinx.coroutines.launch
 import java.nio.file.Paths
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -1449,9 +1450,22 @@ $prootBindSetup
             Log.d(TAG, "Stopped SSHD server")
         }
         terminalProvider = null
-        
+
+        // 删除 Ubuntu 前必须等待本地 PRoot/终端进程退出，避免清理时仍有文件被重新创建。
+        val processes = activeSessions.values.map { it.process }
         activeSessions.keys.toList().forEach { sessionId ->
             closeTerminalSession(sessionId)
+        }
+        processes.forEach { process ->
+            if (process.isAlive) {
+                runCatching {
+                    if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                        Log.w(TAG, "Terminal process did not exit before maintenance cleanup")
+                    }
+                }.onFailure { error ->
+                    Log.w(TAG, "Failed waiting for terminal process during maintenance", error)
+                }
+            }
         }
         sessionManager.cleanup()
         Log.d(TAG, "Prepared terminal manager for maintenance.")
