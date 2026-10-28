@@ -4,7 +4,7 @@ package com.ai.assistance.operit.terminal.view.domain.ansi
  * ANSI 序列扫描器
  * 负责从文本流中识别和提取 ANSI 控制序列
  */
-class AnsiScanner(private val input: String) {
+class AnsiScanner(private val input: String, private val requireComplete: Boolean = false) {
     private var position = 0
     
     /**
@@ -44,7 +44,13 @@ class AnsiScanner(private val input: String) {
         if (!hasNext()) return null
         
         val char = peek() ?: return null
-        
+        if (requireComplete && char == '\u001b' && !hasCompleteEscapeSequence()) {
+            // 未闭合序列保留到下一块；损坏输出的缓存长度受限。
+            if (input.length - position <= 65_536) return null
+            val raw = remainingInput()
+            position = input.length
+            return AnsiSequence.Unknown(raw)
+        }
         return when {
             char == '\u001B' -> scanEscapeSequence()
             char.code in 0..31 || char == '\u007F' -> scanControlCharacter()
@@ -52,13 +58,33 @@ class AnsiScanner(private val input: String) {
         }
     }
     
+    fun remainingInput(): String = input.substring(position)
+
+    private fun hasCompleteEscapeSequence(): Boolean {
+        val introducer = peek(1) ?: return false
+        return when (introducer) {
+            '[' -> (position + 2 until input.length).any { input[it].code in 0x40..0x7e }
+            ']', 'P' -> {
+                var index = position + 2
+                while (index < input.length) {
+                    if (introducer == ']' && input[index] == '\u0007') return true
+                    if (input[index] == '\u001b' && input.getOrNull(index + 1) == '\\') return true
+                    index++
+                }
+                false
+            }
+            else -> true
+        }
+    }
+
     /**
      * 扫描所有序列
      */
     fun scanAll(): List<AnsiSequence> {
         val sequences = mutableListOf<AnsiSequence>()
         while (hasNext()) {
-            scanNext()?.let { sequences.add(it) }
+            val sequence = scanNext() ?: break
+            sequences.add(sequence)
         }
         return sequences
     }

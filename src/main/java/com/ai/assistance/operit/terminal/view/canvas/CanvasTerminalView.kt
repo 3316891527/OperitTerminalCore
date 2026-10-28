@@ -7,6 +7,7 @@ package com.ai.assistance.operit.terminal.view.canvas
  import android.os.Build
  import android.os.Handler
  import android.os.Looper
+import android.os.SystemClock
  import android.util.AttributeSet
  import android.util.Log
  import android.view.ActionMode
@@ -20,11 +21,12 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.VelocityTracker
 import android.view.accessibility.AccessibilityManager
- import android.view.inputmethod.BaseInputConnection
  import android.view.inputmethod.EditorInfo
  import android.view.inputmethod.InputConnection
  import android.view.inputmethod.InputMethodManager
  import android.widget.OverScroller
+import com.ai.assistance.operit.terminal.view.canvas.input.TerminalInputConnection
+import com.ai.assistance.operit.terminal.view.canvas.input.TerminalKeyEncoder
  import com.ai.assistance.operit.terminal.R
  import com.ai.assistance.operit.terminal.view.domain.ansi.AnsiTerminalEmulator
  import com.ai.assistance.operit.terminal.view.domain.ansi.TerminalChar
@@ -64,8 +66,7 @@ class CanvasTerminalView @JvmOverloads constructor(
     }
     
     private val cursorPaint = Paint().apply {
-        color = Color.GREEN
-        alpha = 180
+        color = config.cursorColor
         style = Paint.Style.FILL
     }
     
@@ -565,14 +566,13 @@ class CanvasTerminalView @JvmOverloads constructor(
     // 全屏模式标记
     private var isFullscreenMode = true
     
-    // 方向键长按处理
     private val handler = Handler(Looper.getMainLooper())
-    private var currentArrowKey: Int? = null
-    private var arrowKeyRepeatRunnable: Runnable? = null
-    private var isArrowKeyPressed = false
-    private val longPressDelay = 500L // 长按延迟时间（毫秒）
-    private val repeatInterval = 200L // 重复发送间隔（毫秒）
-    
+    private val keyEncoder = TerminalKeyEncoder()
+    private val consumedKeys = mutableSetOf<Int>()
+    private var terminalInputConnection: TerminalInputConnection? = null
+    @Volatile private var cursorBlinkEpoch = SystemClock.uptimeMillis()
+    @Volatile private var cursorFocused = false
+
     // 无障碍支持
     private val terminalAccessibilityDelegate: TerminalAccessibilityDelegate
     
@@ -762,6 +762,16 @@ class CanvasTerminalView @JvmOverloads constructor(
         // 移除旧的监听器
         removeEmulatorListeners()
         
+        if (this.emulator !== emulator) {
+            terminalInputConnection?.closeConnection()
+            terminalInputConnection = null
+            keyEncoder.reset()
+            consumedKeys.clear()
+            cursorBlinkEpoch = SystemClock.uptimeMillis()
+            if (hasFocus() && isAttachedToWindow) {
+                (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).restartInput(this)
+            }
+        }
         this.emulator = emulator
         // 恢复新模拟器的滚动位置
         sessionId?.let { id ->
@@ -1246,8 +1256,8 @@ class CanvasTerminalView @JvmOverloads constructor(
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         Log.d("CanvasTerminalView", "surfaceDestroyed")
         stopRenderThread()
-        // 清理方向键长按回调，避免内存泄漏
-        handleArrowKeyUp()
+        consumedKeys.clear()
+        keyEncoder.reset()
     }
     
     override fun onDetachedFromWindow() {
@@ -1291,7 +1301,10 @@ class CanvasTerminalView @JvmOverloads constructor(
      */
     fun release() {
         stopRenderThread()
-        handleArrowKeyUp()
+        terminalInputConnection?.closeConnection()
+        terminalInputConnection = null
+        consumedKeys.clear()
+        keyEncoder.reset()
         autoScrollRunnable?.let { handler.removeCallbacks(it) }
         autoScrollRunnable = null
         removeCallbacks(newOutputDispatchRunnable)
@@ -1885,7 +1898,11 @@ class CanvasTerminalView @JvmOverloads constructor(
                     }
 
                     // 绘制光标（光标只在可见屏幕部分显示，需要考虑历史缓冲区偏移）
-                    if (em.isCursorVisible()) {
+                    // 复用渲染线程和单调时钟，失焦时稳定显示，离开页面后不保留闪烁任务。
+                    val blinkRate = config.cursorBlinkRate
+                    val cursorPhaseVisible = !cursorFocused || blinkRate <= 0L ||
+                        (SystemClock.uptimeMillis() - cursorBlinkEpoch) / blinkRate % 2L == 0L
+                    if (em.isCursorVisible() && cursorPhaseVisible) {
                         val cursorRow = historySize + em.getCursorY()
                         val cursorCol = em.getCursorX()
 
@@ -1904,23 +1921,17 @@ class CanvasTerminalView @JvmOverloads constructor(
                                     cursorX += charWidth * cellWidth
                                 }
 
-                                // 获取光标所在字符的宽度
-                                val cursorCharWidth = if (cursorCol < line.size) {
-                                    val cellWidth = textMetrics.getCellWidth(line[cursorCol].char)
-                                    charWidth * cellWidth
-                                } else {
-                                    charWidth
-                                }
+                                val cursorWidth = (resources.displayMetrics.density * 1.5f)
+                                    .coerceAtLeast(1f).coerceAtMost(charWidth)
 
                                 val top = cursorY.coerceAtLeast(contentTop)
                                 val bottom = (cursorY + charHeight).coerceAtMost(contentBottom)
                                 if (bottom > top) {
-                                    cursorPaint.color = Color.GREEN
-                                    cursorPaint.alpha = 180
+                                    cursorPaint.color = config.cursorColor
                                     canvas.drawRect(
                                         cursorX,
                                         top,
-                                        cursorX + cursorCharWidth,
+                                        cursorX + cursorWidth,
                                         bottom,
                                         cursorPaint
                                     )
@@ -2562,130 +2573,78 @@ class CanvasTerminalView @JvmOverloads constructor(
     /**
      * 创建输入连接
      */
-    override fun onCreateInputConnection(outAttrs: EditorInfo?): InputConnection {
+    override fun onCreateInputConnection(outAttrs: EditorInfo?): InputConnection? {
+        if (!isFullscreenMode) return null
         outAttrs?.apply {
-            inputType = EditorInfo.TYPE_CLASS_TEXT
-            imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_ACTION_NONE
+            inputType = EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE or
+                EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                EditorInfo.IME_FLAG_NO_ENTER_ACTION or EditorInfo.IME_ACTION_NONE
+            initialSelStart = 0
+            initialSelEnd = 0
         }
-        
-        return object : BaseInputConnection(this, true) {
-            override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                text?.let {
-                    val normalized = it.toString()
-                        .replace("\r\n", "\r")
-                        .replace('\n', '\r')
-                    inputCallback?.invoke(normalized)
-                }
-                return true
-            }
-            
-            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                if (beforeLength > 0) {
-                    // 发送退格键
-                    inputCallback?.invoke("\u007F") // DEL character
-                }
-                return true
-            }
-            
-            override fun sendKeyEvent(event: KeyEvent?): Boolean {
-                event?.let {
-                    when (it.action) {
-                        KeyEvent.ACTION_DOWN -> {
-                            when (it.keyCode) {
-                                KeyEvent.KEYCODE_DEL -> {
-                                    inputCallback?.invoke("\u007F")
-                                    return true
-                                }
-                                KeyEvent.KEYCODE_ENTER -> {
-                                    inputCallback?.invoke("\r")
-                                    return true
-                                }
-                                KeyEvent.KEYCODE_DPAD_UP,
-                                KeyEvent.KEYCODE_DPAD_DOWN,
-                                KeyEvent.KEYCODE_DPAD_LEFT,
-                                KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                                    // 全屏模式下处理方向键长按
-                                    if (isFullscreenMode) {
-                                        handleArrowKeyDown(it.keyCode)
-                                        return true
-                                    }
-                                }
-                            }
-                        }
-                        KeyEvent.ACTION_UP -> {
-                            when (it.keyCode) {
-                                KeyEvent.KEYCODE_DPAD_UP,
-                                KeyEvent.KEYCODE_DPAD_DOWN,
-                                KeyEvent.KEYCODE_DPAD_LEFT,
-                                KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                                    // 全屏模式下处理方向键释放
-                                    if (isFullscreenMode) {
-                                        handleArrowKeyUp()
-                                        return true
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                return super.sendKeyEvent(event)
-            }
-        }
+        terminalInputConnection?.closeConnection()
+        return TerminalInputConnection(this, ::sendTerminalInput).also { terminalInputConnection = it }
     }
-    
-    /**
-     * 处理方向键按下
-     */
-    private fun handleArrowKeyDown(keyCode: Int) {
-        // 如果已经有其他方向键被按下，先释放
-        if (isArrowKeyPressed && currentArrowKey != keyCode) {
-            handleArrowKeyUp()
-        }
-        
-        currentArrowKey = keyCode
-        isArrowKeyPressed = true
-        
-        // 立即发送一次方向键
-        sendArrowKey(keyCode)
-        
-        // 延迟后开始重复发送
-        arrowKeyRepeatRunnable = object : Runnable {
-            override fun run() {
-                if (isArrowKeyPressed && currentArrowKey == keyCode) {
-                    sendArrowKey(keyCode)
-                    handler.postDelayed(this, repeatInterval)
-                }
-            }
-        }
-        handler.postDelayed(arrowKeyRepeatRunnable!!, longPressDelay)
+
+    private fun sendTerminalInput(text: String) {
+        if (!isFullscreenMode || text.isEmpty()) return
+        cursorBlinkEpoch = SystemClock.uptimeMillis()
+        inputCallback?.invoke(text)
+        requestRender()
     }
-    
-    /**
-     * 处理方向键释放
-     */
-    private fun handleArrowKeyUp() {
-        isArrowKeyPressed = false
-        currentArrowKey = null
-        arrowKeyRepeatRunnable?.let {
-            handler.removeCallbacks(it)
-            arrowKeyRepeatRunnable = null
+
+    private fun handleTerminalKey(event: KeyEvent): Boolean {
+        if (!isFullscreenMode) return false
+        val text = keyEncoder.encode(event, emulator?.isApplicationCursorKeysEnabled() == true) ?: return false
+        consumedKeys.add(event.keyCode)
+        if (text.isNotEmpty()) {
+            sendTerminalInput(terminalInputConnection?.takePendingText().orEmpty() + text)
         }
+        return true
     }
-    
-    /**
-     * 发送方向键的 ANSI 转义序列
-     */
-    private fun sendArrowKey(keyCode: Int) {
-        val escapeSequence = when (keyCode) {
-            KeyEvent.KEYCODE_DPAD_UP -> "\u001b[A"    // ESC [ A
-            KeyEvent.KEYCODE_DPAD_DOWN -> "\u001b[B"  // ESC [ B
-            KeyEvent.KEYCODE_DPAD_RIGHT -> "\u001b[C" // ESC [ C
-            KeyEvent.KEYCODE_DPAD_LEFT -> "\u001b[D"   // ESC [ D
-            else -> return
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
+        handleTerminalKey(event) || super.onKeyDown(keyCode, event)
+
+    override fun onKeyShortcut(keyCode: Int, event: KeyEvent): Boolean =
+        handleTerminalKey(event) || super.onKeyShortcut(keyCode, event)
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean =
+        consumedKeys.remove(keyCode) || super.onKeyUp(keyCode, event)
+
+    override fun onKeyMultiple(keyCode: Int, repeatCount: Int, event: KeyEvent): Boolean {
+        val characters = event.characters
+        if (isFullscreenMode && keyCode == KeyEvent.KEYCODE_UNKNOWN && !characters.isNullOrEmpty()) {
+            val text = characters.replace("\r\n", "\r").replace('\n', '\r')
+            sendTerminalInput(terminalInputConnection?.takePendingText().orEmpty() + text)
+            return true
         }
-        inputCallback?.invoke(escapeSequence)
+        return super.onKeyMultiple(keyCode, repeatCount, event)
     }
-    
+
+    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        cursorFocused = gainFocus && hasWindowFocus()
+        cursorBlinkEpoch = SystemClock.uptimeMillis()
+        if (!gainFocus) {
+            consumedKeys.clear()
+            keyEncoder.reset()
+        }
+        requestRender()
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        cursorFocused = hasWindowFocus && hasFocus()
+        cursorBlinkEpoch = SystemClock.uptimeMillis()
+        if (!hasWindowFocus) {
+            consumedKeys.clear()
+            keyEncoder.reset()
+        }
+        requestRender()
+    }
+
     /**
      * 检查是否可以显示输入法
      */

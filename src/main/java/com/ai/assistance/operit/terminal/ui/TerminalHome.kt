@@ -162,39 +162,8 @@ fun TerminalHome(
     var ctrlActive by remember { mutableStateOf(false) }
     var altActive by remember { mutableStateOf(false) }
 
-    fun applyCtrlModifierChar(ch: Char): String? {
-        return when {
-            ch in 'a'..'z' || ch in 'A'..'Z' -> {
-                val code = ch.uppercaseChar().code - 64
-                code.toChar().toString()
-            }
-            ch == ' ' || ch == '@' -> "\u0000"
-            ch == '[' -> "\u001b"
-            ch == '\\' -> "\u001c"
-            ch == ']' -> "\u001d"
-            ch == '^' -> "\u001e"
-            ch == '_' -> "\u001f"
-            else -> null
-        }
-    }
-
-    fun applyCtrlModifierToText(input: String): String {
-        if (!ctrlActive) return input
-        val sb = StringBuilder()
-        input.forEach { ch ->
-            val mapped = applyCtrlModifierChar(ch)
-            if (mapped != null) sb.append(mapped) else sb.append(ch)
-        }
-        return sb.toString()
-    }
-
-    fun applyModifiers(input: String): String {
-        var output = applyCtrlModifierToText(input)
-        if (altActive) {
-            output = if (output.startsWith("\u001b")) output else "\u001b$output"
-        }
-        return output
-    }
+    fun applyModifiers(input: String): String =
+        com.ai.assistance.operit.terminal.view.canvas.input.applyTerminalModifiers(input, ctrlActive, altActive)
 
     fun consumeModifiers() {
         if (ctrlActive) ctrlActive = false
@@ -445,7 +414,7 @@ fun TerminalHome(
                                     fontFamily = FontFamily.Monospace,
                                     fontSize = fontSize
                                 ),
-                                cursorBrush = SolidColor(Color.Green),
+                                cursorBrush = SolidColor(Color(fontConfig.cursorColor)),
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                                 keyboardActions = KeyboardActions(onSend = {

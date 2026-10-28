@@ -88,6 +88,7 @@ class AnsiTerminalEmulator(
     // 终端模式标志
     private val terminalModes = mutableMapOf<Int, Boolean>()
     private var cursorVisible = true
+    @Volatile private var applicationCursorKeys = false
     private var autoWrapMode = true
     private var originMode = false
     
@@ -103,13 +104,14 @@ class AnsiTerminalEmulator(
     
     // 缓存完整内容的视图（避免每次创建新列表）
     private val fullContentView = FullContentView()
+    private var pendingAnsiInput = ""
     
     /**
      * 解析并执行 ANSI 序列
      */
     fun parse(text: String) {
-        val scanner = AnsiScanner(text)
-        
+        val scanner = AnsiScanner(pendingAnsiInput + text, requireComplete = true)
+        pendingAnsiInput = ""
         while (scanner.hasNext()) {
             when (val seq = scanner.scanNext()) {
                 is AnsiSequence.Text -> handleText(seq.char)
@@ -125,6 +127,7 @@ class AnsiTerminalEmulator(
             }
         }
         
+        pendingAnsiInput = scanner.remainingInput()
         // 通知监听器内容已改变
         notifyChange()
         // 通知新输出监听器
@@ -400,7 +403,7 @@ class AnsiTerminalEmulator(
             
             if (isPrivate) {
                 when (param) {
-                    1 -> {} // DECCKM - 光标键模式
+                    1 -> applicationCursorKeys = enable // 应用光标键模式
                     3 -> {} // DECCOLM - 132列模式
                     6 -> originMode = enable // DECOM - 原点模式
                     7 -> autoWrapMode = enable // DECAWM - 自动换行模式
@@ -668,6 +671,7 @@ class AnsiTerminalEmulator(
         scrollTop = 0
         scrollBottom = screenHeight - 1
         terminalModes.clear()
+        applicationCursorKeys = false
         autoWrapMode = true
         originMode = false
         cursorVisible = true
@@ -691,6 +695,7 @@ class AnsiTerminalEmulator(
     fun getCursorX(): Int = cursorX
     fun getCursorY(): Int = cursorY
     fun isCursorVisible(): Boolean = cursorVisible
+    fun isApplicationCursorKeysEnabled(): Boolean = applicationCursorKeys
     
     fun getScreenContent(): Array<Array<TerminalChar>> = screenBuffer
     

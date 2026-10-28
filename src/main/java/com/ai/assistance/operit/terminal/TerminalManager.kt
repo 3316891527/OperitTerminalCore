@@ -55,6 +55,8 @@ class TerminalManager private constructor(
 ) {
     internal val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val commandEventChannel = Channel<CommandExecutionEvent>(Channel.UNLIMITED)
+    private data class PendingInput(val sessionId: String, val text: String)
+    private val inputEventChannel = Channel<PendingInput>(Channel.UNLIMITED)
     private val envInitMutex = Mutex()
     private val sessionStartMutex = Mutex()
     private var isEnvInitialized = false
@@ -200,6 +202,22 @@ class TerminalManager private constructor(
         coroutineScope.launch {
             for (event in commandEventChannel) {
                 _commandExecutionEvents.emit(event)
+            }
+        }
+        // 单一消费者按键入顺序写入，并固定输入发生时的会话，避免回车抢在文本前面。
+        coroutineScope.launch {
+            for (input in inputEventChannel) {
+                val session = sessionManager.getSession(input.sessionId) ?: continue
+                try {
+                    writeInputToKernel(session, input.text, "direct-input")
+                    if (session.isWaitingForInteractiveInput) {
+                        sessionManager.updateSession(session.id) {
+                            it.copy(isWaitingForInteractiveInput = false)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error sending input", e)
+                }
             }
         }
 
@@ -515,21 +533,13 @@ class TerminalManager private constructor(
      * 发送输入
      */
     fun sendInput(input: String) {
-        coroutineScope.launch(Dispatchers.IO) {
-            val session = sessionManager.getCurrentSession() ?: return@launch
-
-            try {
-                writeInputToKernel(session, input, "direct-input")
-
-                // 如果用户提供了交互式输入，则重置等待状态
-                if (session.isWaitingForInteractiveInput) {
-                    sessionManager.updateSession(session.id) {
-                        it.copy(isWaitingForInteractiveInput = false)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error sending input", e)
-            }
+        val session = sessionManager.getCurrentSession() ?: return
+        // 虚拟按键同样遵守全屏程序启用的应用光标键模式，已编码的修饰序列保持原样。
+        val text = if (session.ansiParser.isApplicationCursorKeysEnabled() &&
+            input.length == 3 && input.startsWith("\u001b[") && input.last() in "ABCDHF"
+        ) "\u001bO${input.last()}" else input
+        if (!inputEventChannel.trySend(PendingInput(session.id, text)).isSuccess) {
+            Log.w(TAG, "Terminal input queue is closed for session ${session.id}")
         }
     }
 
@@ -580,11 +590,12 @@ class TerminalManager private constructor(
                     val readJob = launch {
                         var reachedEof = false
                         try {
-                            terminalSession.stdout.use { inputStream ->
-                                val buffer = ByteArray(4096)
-                                var bytesRead: Int
-                                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                                    val chunk = String(buffer, 0, bytesRead)
+                            // 使用持续解码器，中文与目录标记跨 PTY 字节块时不会被拆成乱码。
+                            terminalSession.stdout.reader(Charsets.UTF_8).use { reader ->
+                                val buffer = CharArray(4096)
+                                var charsRead: Int
+                                while (reader.read(buffer).also { charsRead = it } != -1) {
+                                    val chunk = String(buffer, 0, charsRead)
                                     Log.d(TAG, "Read chunk: '$chunk'")
                                     outputProcessor.processOutput(sessionId, chunk, sessionManager)
                                 }
@@ -1220,11 +1231,41 @@ EOF
             "          probe_and_append_bind_arg \"${mount.sourcePath}\" \"${mount.targetPath}\""
         }
         
+        val configureVisibleShell = """
+        configure_visible_shell(){
+          mkdir -p "${'$'}UBUNTU_PATH/etc/operit" || return
+          cat <<'OPERIT_BASHRC' > "${'$'}UBUNTU_PATH/etc/operit/terminal.bashrc"
+        # 载入原登录配置后再设置应用提示符，不改写用户的配置文件。
+        if [ -r /etc/profile ]; then . /etc/profile; fi
+        if [ -r "${'$'}HOME/.bash_profile" ]; then
+          . "${'$'}HOME/.bash_profile"
+        elif [ -r "${'$'}HOME/.bash_login" ]; then
+          . "${'$'}HOME/.bash_login"
+        elif [ -r "${'$'}HOME/.profile" ]; then
+          . "${'$'}HOME/.profile"
+        fi
+        # 保留已有提示符钩子，并在其后恢复零宽度提示符及原退出状态。
+        __operit_terminal_prompt(){
+          local __operit_status=${'$'}?
+          __operit_prompt_directory=${'$'}{PWD//%/%25}
+          __operit_prompt_directory=${'$'}{__operit_prompt_directory//${'$'}'\a'/%07}
+          __operit_prompt_directory=${'$'}{__operit_prompt_directory//${'$'}'\e'/%1B}
+          __operit_prompt_directory=${'$'}{__operit_prompt_directory//${'$'}'\r'/%0D}
+          __operit_prompt_directory=${'$'}{__operit_prompt_directory//${'$'}'\n'/%0A}
+          PS1='\[\e]777;operit-prompt;${'$'}__operit_prompt_directory\a\]'
+          return "${'$'}__operit_status"
+        }
+        PROMPT_COMMAND+=(__operit_terminal_prompt)
+        __operit_terminal_prompt
+        OPERIT_BASHRC
+        }
+        """.trimIndent()
+
         val loginUbuntu = """
         login_ubuntu(){
           COMMAND_TO_EXEC="$1"
           if [ -z "${'$'}COMMAND_TO_EXEC" ]; then
-            COMMAND_TO_EXEC="/bin/bash -il"
+            COMMAND_TO_EXEC="/bin/bash --rcfile /etc/operit/terminal.bashrc -i"
           fi
 
           # Setup fake sysdata
@@ -1367,12 +1408,13 @@ $prootBindSetup
           install_ubuntu
           configure_sources
           fix_permissions
+          configure_visible_shell || return
           sleep 1
           bump_progress
           
           # 先进入Ubuntu环境，然后连接SSH
           # 当SSH退出时，用户会回到本地Ubuntu shell
-          login_ubuntu 'echo "Connecting to SSH..."; '"${'$'}SSH_COMMAND"'; echo "SSH connection closed. You are now in local Ubuntu terminal."; /bin/bash -il'
+          login_ubuntu 'echo "Connecting to SSH..."; '"${'$'}SSH_COMMAND"'; echo "SSH connection closed. You are now in local Ubuntu terminal."; /bin/bash --rcfile /etc/operit/terminal.bashrc -i'
         }
         """.trimIndent()
 
@@ -1381,6 +1423,7 @@ $prootBindSetup
         $installUbuntu
         $configureSources
         $fixPermissions
+        $configureVisibleShell
         $loginUbuntu
         $sshShell
         clear_lines
@@ -1388,6 +1431,7 @@ $prootBindSetup
           install_ubuntu
           configure_sources
           fix_permissions
+          configure_visible_shell || return
           sleep 1
           bump_progress
           login_ubuntu
@@ -1473,6 +1517,7 @@ $prootBindSetup
 
     fun cleanup() {
         prepareForMaintenance()
+        inputEventChannel.cancel()
         commandEventChannel.close()
         coroutineScope.cancel()
         Log.d(TAG, "All active sessions cleaned up.")

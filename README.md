@@ -32,3 +32,8 @@ This module can be integrated as a Git Submodule. The client application can eit
 ## 独立发行整合
 
 [终端核心来源与协同行为](docs/distribution_integration.md) 记录独立发行分支所包含的修复及验证范围。
+
+
+## 终端输入与显示
+
+[终端显示与键盘输入](docs/terminal_input.md) 说明零宽提示符、输入事件编码、会话顺序和光标配置。

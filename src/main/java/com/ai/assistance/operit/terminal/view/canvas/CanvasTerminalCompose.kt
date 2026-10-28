@@ -91,7 +91,7 @@ fun ConfigurableCanvasTerminal(
     fontSize: Float = 14f,
     backgroundColor: Int = 0xFF000000.toInt(),
     foregroundColor: Int = 0xFFFFFFFF.toInt(),
-    cursorColor: Int = 0xFF00FF00.toInt(),
+    cursorColor: Int = foregroundColor,
     onInput: (String) -> Unit = {}
 ) {
     val config = remember(fontSize, backgroundColor, foregroundColor, cursorColor) {

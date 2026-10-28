@@ -13,7 +13,7 @@ data class RenderConfig(
     val backgroundColor: Int = Color.BLACK,
     val foregroundColor: Int = Color.WHITE, // 添加前景色
     val defaultForegroundColor: Int = foregroundColor,
-    val cursorColor: Int = Color.GREEN,
+    val cursorColor: Int = foregroundColor,
     val cursorBlinkRate: Long = 500L, // 光标闪烁频率（毫秒）
     val lineSpacing: Float = 0.1f, // 行间距（相对于字符高度的比例）
     val charSpacing: Float = 0f, // 字符间距（像素）

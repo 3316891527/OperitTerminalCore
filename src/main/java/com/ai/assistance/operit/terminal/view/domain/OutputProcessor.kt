@@ -7,13 +7,15 @@ import com.ai.assistance.operit.terminal.SessionManager
 import com.ai.assistance.operit.terminal.data.SessionInitState
 import com.ai.assistance.operit.terminal.data.TerminalSessionData
 import com.ai.assistance.operit.terminal.view.domain.ansi.AnsiUtils
+import com.ai.assistance.operit.terminal.view.domain.shell.ShellPromptStream
 
 /**
  * 终端输出的会话处理状态
  * @property justHandledCarriageReturn 如果最近处理的行分隔符是回车符（CR），则为 true
  */
 private data class SessionProcessingState(
-    var justHandledCarriageReturn: Boolean = false
+    var justHandledCarriageReturn: Boolean = false,
+    val promptStream: ShellPromptStream = ShellPromptStream()
 )
 
 /**
@@ -45,6 +47,21 @@ class OutputProcessor(
         chunk: String,
         sessionManager: SessionManager
     ) {
+        if (sessionManager.getSession(sessionId) == null) return
+        val state = sessionStates.getOrPut(sessionId) { SessionProcessingState() }
+        for (part in state.promptStream.feed(chunk)) {
+            when (part) {
+                is ShellPromptStream.Part.Output -> processTerminalOutput(sessionId, part.text, sessionManager)
+                is ShellPromptStream.Part.Prompt -> handleShellPrompt(sessionId, part.directory, sessionManager)
+            }
+        }
+    }
+
+    private fun processTerminalOutput(
+        sessionId: String,
+        chunk: String,
+        sessionManager: SessionManager
+    ) {
         val session = sessionManager.getSession(sessionId) ?: return
         session.rawBuffer.append(chunk)
 
@@ -55,18 +72,12 @@ class OutputProcessor(
 
         Log.d(TAG, "Processing chunk for session $sessionId. New buffer size: ${session.rawBuffer.length}")
 
-        // 始终检查全屏模式切换
-        if (detectFullscreenMode(sessionId, session.rawBuffer, sessionManager)) {
-            // 如果检测到模式切换，缓冲区可能已被修改，及早返回以处理下一个块
-            return
-        }
-
-        // 始终更新 ANSI 解析器（用于 Canvas 渲染），包括初始化阶段
-        // 这样用户可以看到初始化过程中的所有输出，包括错误信息
+        // 先将整个数据块交给渲染器，不能因模式切换丢掉进入、退出或选项内容。
         session.ansiParser.parse(chunk)
+        detectFullscreenMode(sessionId, session.rawBuffer, sessionManager)
         
         // 如果在全屏模式下，跳过行解析逻辑（全屏应用自己管理屏幕）
-        if (session.isFullscreen) {
+        if (sessionManager.getSession(sessionId)?.isFullscreen == true) {
             // 不需要再次解析，ansiParser 已经更新
             return
         }
@@ -121,7 +132,7 @@ class OutputProcessor(
                 val cleanContent = AnsiUtils.stripAnsi(bufferContent)
                 
                 // 检查是否是普通 shell 提示符
-                val isShellPrompt = isPrompt(cleanContent)
+                val isShellPrompt = !state.promptStream.hasPromptProtocol && isPrompt(cleanContent)
                 
                 // 使用 PTY 模式检测是否在等待输入
                 val isWaitingInput = isInteractivePrompt(cleanContent, sessionId, sessionManager)
@@ -163,9 +174,8 @@ class OutputProcessor(
         
         // 检查是否是命令提示符（优先级最高）
         // 即使是 CR line，如果是提示符也应该作为命令完成处理
-        if (isPrompt(cleanLine.trim())) {
+        if (handlePrompt(sessionId, cleanLine, sessionManager)) {
             Log.d(TAG, "Detected prompt in CR line: '$cleanLine'")
-            handlePrompt(sessionId, cleanLine, sessionManager)
             sessionStates[sessionId]?.justHandledCarriageReturn = false
             return
         }
@@ -273,8 +283,7 @@ class OutputProcessor(
                 session.copy(initState = SessionInitState.READY)
             }
             
-            // 发送欢迎语到 Canvas
-            sendWelcomeMessage(sessionId, sessionManager)
+            clearInitialScreen(sessionId, sessionManager)
         } else {
             Log.d(TAG, "Not a prompt, continuing to wait...")
         }
@@ -368,6 +377,7 @@ class OutputProcessor(
         line: String,
         sessionManager: SessionManager
     ): Boolean {
+        if (sessionStates[sessionId]?.promptStream?.hasPromptProtocol == true) return false
         val session = sessionManager.getSession(sessionId) ?: return false
 
         val cwdPromptRegex = Regex("<cwd>(.*)</cwd>.*[#$]")
@@ -747,10 +757,10 @@ class OutputProcessor(
 
         val bufferContent = buffer.toString()
 
-        val enterIndex = bufferContent.indexOf(enterFullscreen)
-        val exitIndex = bufferContent.indexOf(exitFullscreen)
+        val enterIndex = bufferContent.lastIndexOf(enterFullscreen)
+        val exitIndex = bufferContent.lastIndexOf(exitFullscreen)
 
-        if (enterIndex != -1) {
+        if (enterIndex > exitIndex) {
             Log.d(TAG, "Entering fullscreen mode for session $sessionId")
             
             sessionManager.updateSession(sessionId) { session ->
@@ -784,33 +794,34 @@ class OutputProcessor(
         return false
     }
 
-    /**
-     * 发送欢迎消息到 Canvas
-     * 在 READY 状态时清屏，然后显示欢迎消息
-     */
-    private fun sendWelcomeMessage(sessionId: String, sessionManager: SessionManager) {
-        val session = sessionManager.getSession(sessionId) ?: return
-        
-        // 构建欢迎消息，包含 ANSI 控制序列
-        // \u001B[2J - 清屏（清除初始化过程中的所有输出）
-        // \u001B[H - 移动光标到左上角
-        // 使用 \r\n 确保正确换行（\r 回车到行首，\n 换到下一行）
-        val welcomeMessage = "\u001B[2J\u001B[H" +
-            "  ___                   _ _   \r\n" +
-            " / _ \\ _ __   ___ _ __ (_) |_ \r\n" +
-            "| | | | '_ \\ / _ \\ '__ | | __|\r\n" +
-            "| |_| | |_) |  __/ |   | | |_ \r\n" +
-            " \\___/| .__/ \\___|_|   |_|\\__|\r\n" +
-            "      |_|                    \r\n" +
-            "\r\n" +
-            "  >> Your portable Ubuntu environment on Android <<\r\n" +
-            "\r\n"
-        
-        // 直接发送到 ANSI 解析器（Canvas 渲染）
-        // 清屏操作会清除之前初始化过程中的所有输出
-        session.ansiParser.parse(welcomeMessage)
-        
-        Log.d(TAG, "Screen cleared and welcome message sent to Canvas for session $sessionId")
+    /** 只清理初始化画面，终端就绪后直接从左上角输入。 */
+    private fun clearInitialScreen(sessionId: String, sessionManager: SessionManager) {
+        sessionManager.getSession(sessionId)?.ansiParser?.parse("\u001b[2J\u001b[H")
     }
 
+    private fun handleShellPrompt(sessionId: String, directory: String, sessionManager: SessionManager) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        if (session.rawBuffer.isNotEmpty()) {
+            val tail = session.rawBuffer.toString()
+            session.rawBuffer.clear()
+            processLine(sessionId, tail, sessionManager)
+        }
+        val state = sessionStates.getOrPut(sessionId) { SessionProcessingState() }
+        state.justHandledCarriageReturn = false
+        if (session.initState != SessionInitState.READY) clearInitialScreen(sessionId, sessionManager)
+        val currentDirectory = "$directory $"
+        sessionManager.updateSession(sessionId) {
+            it.copy(
+                initState = SessionInitState.READY,
+                currentDirectory = currentDirectory,
+                isFullscreen = false,
+                isWaitingForInteractiveInput = false,
+                lastInteractivePrompt = "",
+                isInteractiveMode = false,
+                interactivePrompt = ""
+            )
+        }
+        onDirectoryChangeEvent(SessionDirectoryEvent(sessionId, currentDirectory))
+        // 本地命令以原唯一完成标记结束，不在两条注入命令之间的提示符处提前结束。
+    }
 }
