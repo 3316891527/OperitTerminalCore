@@ -1261,7 +1261,10 @@ class CanvasTerminalView @JvmOverloads constructor(
     }
     
     override fun onDetachedFromWindow() {
-        release()
+        // 临时离开窗口只暂停绘制，最终释放由 Compose 的 onRelease 负责。
+        stopRenderThread()
+        consumedKeys.clear()
+        keyEncoder.reset()
         super.onDetachedFromWindow()
     }
 

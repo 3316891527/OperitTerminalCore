@@ -727,73 +727,73 @@ class AnsiTerminalEmulator(
      */
     fun getHistorySize(): Int = historyBuffer.size
     
+    private data class ReflowCursor(val line: Int, val column: Int, val pendingWrap: Boolean)
+    private data class ReflowContent(
+        val lines: MutableList<MutableList<TerminalChar>>,
+        val cursor: ReflowCursor,
+        val savedCursor: ReflowCursor,
+    )
+
     fun resize(newWidth: Int, newHeight: Int) {
+        require(newWidth > 0 && newHeight > 0)
         if (newWidth == screenWidth && newHeight == screenHeight) return
-        
-        // 主流程：收集 -> 清理 -> 重排 -> 分配
-        val logicalLines = collectLogicalLines()
-        trimTrailingEmptyLines(logicalLines)
-        val (newPhysicalLines, newPhysicalWrapped) = rewrapLogicalLines(logicalLines, newWidth)
-        
-        // 更新尺寸并重建缓冲区
+
+        // 把光标绑定到逻辑行的字符位置，避免后台、键盘和窗口尺寸变化后回到行首。
+        val content = collectLogicalLines()
+        trimTrailingEmptyLines(content.lines, maxOf(content.cursor.line, content.savedCursor.line) + 1)
+        val (physicalLines, wrapped) = rewrapLogicalLines(content.lines, newWidth)
+        fun position(anchor: ReflowCursor): Pair<Int, Int> {
+            var row = 0
+            for (i in 0 until anchor.line) {
+                row += maxOf(1, (content.lines[i].size + newWidth - 1) / newWidth)
+            }
+            val pending = anchor.pendingWrap && anchor.column > 0 && anchor.column % newWidth == 0
+            row += if (pending) anchor.column / newWidth - 1 else anchor.column / newWidth
+            val column = if (pending) newWidth else anchor.column % newWidth
+            return row to column
+        }
+        val currentPosition = position(content.cursor)
+        val savedPosition = position(content.savedCursor)
         screenWidth = newWidth
         screenHeight = newHeight
-        distributeToBuffers(newPhysicalLines, newPhysicalWrapped)
-        
-        // 重置滚动区域和光标
+        distributeToBuffers(physicalLines, wrapped)
+        val firstScreenRow = (physicalLines.size - screenHeight).coerceAtLeast(0)
+        cursorY = (currentPosition.first - firstScreenRow).coerceIn(0, screenHeight - 1)
+        cursorX = currentPosition.second
+        savedCursorY = (savedPosition.first - firstScreenRow).coerceIn(0, screenHeight - 1)
+        savedCursorX = savedPosition.second
         scrollTop = 0
         scrollBottom = screenHeight - 1
-        cursorX = 0
-        
         notifyChange()
     }
-    
-    /**
-     * 收集所有逻辑行（合并历史+屏幕的软换行）
-     */
-    private fun collectLogicalLines(): MutableList<MutableList<TerminalChar>> {
+
+    /** 收集历史和屏幕软换行，同时保留当前及已保存光标所在的空白位置。 */
+    private fun collectLogicalLines(): ReflowContent {
         val logicalLines = mutableListOf<MutableList<TerminalChar>>()
         var currentLogicalLine = mutableListOf<TerminalChar>()
-        
-        // 辅助函数：处理一行物理行
-        fun processPhysicalLine(line: Array<TerminalChar>, isWrapped: Boolean) {
-            // 计算有效长度：软换行取整行，硬换行去除末尾空白
-            val effectiveLength = if (isWrapped) {
-                line.size
-            } else {
-                findLastNonEmptyIndex(line) + 1
+        var currentAnchor = ReflowCursor(0, 0, false)
+        var savedAnchor = ReflowCursor(0, 0, false)
+        fun processPhysicalLine(line: Array<TerminalChar>, isWrapped: Boolean, screenRow: Int?) {
+            var effectiveLength = if (isWrapped) line.size else findLastNonEmptyIndex(line) + 1
+            fun anchor(column: Int): ReflowCursor {
+                // 未待换行的光标需要一个实际空白格承载，避免恰好满行时被折回上一行。
+                effectiveLength = maxOf(effectiveLength, (column + if (column < screenWidth) 1 else 0).coerceAtMost(line.size))
+                return ReflowCursor(logicalLines.size, currentLogicalLine.size + column, column == screenWidth)
             }
-            
-            // 添加有效字符到当前逻辑行
-            for (i in 0 until effectiveLength) {
-                currentLogicalLine.add(line[i])
-            }
-            
-            // 硬换行：逻辑行结束
+            if (screenRow == cursorY) currentAnchor = anchor(cursorX)
+            if (screenRow == savedCursorY) savedAnchor = anchor(savedCursorX.coerceIn(0, screenWidth))
+            for (i in 0 until effectiveLength) currentLogicalLine.add(line[i])
             if (!isWrapped) {
                 logicalLines.add(currentLogicalLine)
                 currentLogicalLine = mutableListOf()
             }
         }
-        
-        // 处理历史缓冲区
-        for (i in historyBuffer.indices) {
-            processPhysicalLine(historyBuffer[i], historyWrapped[i])
-        }
-        
-        // 处理屏幕缓冲区
-        for (i in 0 until screenHeight) {
-            processPhysicalLine(screenBuffer[i], lineWrapped[i])
-        }
-        
-        // 处理残留的逻辑行（最后一行是软换行的情况）
-        if (currentLogicalLine.isNotEmpty()) {
-            logicalLines.add(currentLogicalLine)
-        }
-        
-        return logicalLines
+        for (i in historyBuffer.indices) processPhysicalLine(historyBuffer[i], historyWrapped[i], null)
+        for (i in 0 until screenHeight) processPhysicalLine(screenBuffer[i], lineWrapped[i], i)
+        if (currentLogicalLine.isNotEmpty()) logicalLines.add(currentLogicalLine)
+        return ReflowContent(logicalLines, currentAnchor, savedAnchor)
     }
-    
+
     /**
      * 查找行中最后一个非空字符的索引
      */
@@ -811,8 +811,8 @@ class AnsiTerminalEmulator(
     /**
      * 移除末尾连续的空逻辑行
      */
-    private fun trimTrailingEmptyLines(logicalLines: MutableList<MutableList<TerminalChar>>) {
-        while (logicalLines.isNotEmpty()) {
+    private fun trimTrailingEmptyLines(logicalLines: MutableList<MutableList<TerminalChar>>, minimumLines: Int) {
+        while (logicalLines.size > minimumLines) {
             val lastLine = logicalLines.last()
             if (lastLine.isEmpty() || lastLine.all { 
                 it.char == ' ' && it.bgColor == Color.BLACK && !it.isInverse && !it.isUnderline 
@@ -883,7 +883,6 @@ class AnsiTerminalEmulator(
                 screenBuffer[i] = physicalLines[i]
                 lineWrapped[i] = wrappedFlags[i]
             }
-            cursorY = (totalLines - 1).coerceAtLeast(0)
         } else {
             // 内容超过一屏，分流到历史和屏幕
             val historyCount = totalLines - screenHeight
@@ -901,7 +900,6 @@ class AnsiTerminalEmulator(
                 lineWrapped[i] = wrappedFlags[historyCount + i]
             }
             
-            cursorY = screenHeight - 1
         }
     }
     
