@@ -190,6 +190,14 @@ class TerminalManager private constructor(
             ubuntuArchivePreparer = preparer
         }
 
+        @Volatile
+        private var localSessionInitializer: (Context) -> String = { ":" }
+
+        /** 宿主在创建终端前注册本地会话初始化命令；命令失败时不发送就绪标记。 */
+        fun setLocalSessionInitializer(initializer: (Context) -> String) {
+            localSessionInitializer = initializer
+        }
+
         private const val TAG = "TerminalManager"
         private const val UBUNTU_FILENAME = "ubuntu-noble-aarch64-pd-v4.18.0.tar.xz"
         private const val MAX_HISTORY_ITEMS = 500
@@ -1261,9 +1269,13 @@ EOF
         }
         """.trimIndent()
 
+        // 初始化脚本通过独立环境变量传入，避免嵌套 shell 展开路径、引号和美元符号。
+        val localSessionInit = localSessionInitializer(context)
+        val quotedLocalSessionInit = "'" + localSessionInit.replace("'", "'\"'\"'") + "'"
         val loginUbuntu = """
         login_ubuntu(){
           COMMAND_TO_EXEC="$1"
+          OPERIT_LOCAL_SESSION_INIT=$quotedLocalSessionInit
           if [ -z "${'$'}COMMAND_TO_EXEC" ]; then
             COMMAND_TO_EXEC="/bin/bash --rcfile /etc/operit/terminal.bashrc -i"
           fi
@@ -1292,6 +1304,8 @@ EOF
           if [ "${'$'}USE_CHROOT" = "1" ]; then
             CMD_FILE="${'$'}TMPDIR/command_to_exec"
             printf "%s" "${'$'}COMMAND_TO_EXEC" > "${'$'}CMD_FILE" 2>/dev/null || true
+            INIT_FILE="${'$'}TMPDIR/local_session_init"
+            printf "%s" "${'$'}OPERIT_LOCAL_SESSION_INIT" > "${'$'}INIT_FILE" || return 1
             CHROOT_WRAPPER="${'$'}TMPDIR/operit_chroot_wrapper.sh"
             cat > "${'$'}CHROOT_WRAPPER" <<'EOF'
         BIN="$1"
@@ -1301,6 +1315,7 @@ EOF
         OPERIT_UID="$5"
         OPERIT_GID="$6"
         OPERIT_GROUPS="$7"
+        INIT_FILE="$8"
         mount_bind(){
           source_path="${'$'}1"
           target_path="${'$'}2"
@@ -1338,7 +1353,8 @@ EOF
         mount_bind /data/local/tmp "${'$'}UBUNTU_PATH/data/local/tmp"
         mount_bind "${'$'}HOME_DIR" "${'$'}UBUNTU_PATH${'$'}HOME_DIR"
         COMMAND_TO_EXEC="$(cat "${'$'}CMD_FILE" 2>/dev/null)"
-        "${'$'}BIN/busybox" chroot "${'$'}UBUNTU_PATH" /usr/bin/env -i HOME=/root TERM=xterm-256color LANG=en_US.UTF-8 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "COMMAND_TO_EXEC=${'$'}COMMAND_TO_EXEC" "OPERIT_UID=${'$'}OPERIT_UID" "OPERIT_GID=${'$'}OPERIT_GID" "OPERIT_GROUPS=${'$'}OPERIT_GROUPS" /bin/bash -lc 'echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; umask 0002; if [ -n "${'$'}OPERIT_GID" ]; then chown 0:"${'$'}OPERIT_GID" /root 2>/dev/null || true; chmod 2775 /root 2>/dev/null || true; fi; eval "${'$'}COMMAND_TO_EXEC"'
+        OPERIT_LOCAL_SESSION_INIT="$(cat "${'$'}INIT_FILE")" || exit 1
+        "${'$'}BIN/busybox" chroot "${'$'}UBUNTU_PATH" /usr/bin/env -i HOME=/root TERM=xterm-256color LANG=en_US.UTF-8 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "COMMAND_TO_EXEC=${'$'}COMMAND_TO_EXEC" "OPERIT_LOCAL_SESSION_INIT=${'$'}OPERIT_LOCAL_SESSION_INIT" "OPERIT_UID=${'$'}OPERIT_UID" "OPERIT_GID=${'$'}OPERIT_GID" "OPERIT_GROUPS=${'$'}OPERIT_GROUPS" /bin/bash -lc 'eval "${'$'}OPERIT_LOCAL_SESSION_INIT" || exit ${'$'}?; echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; umask 0002; if [ -n "${'$'}OPERIT_GID" ]; then chown 0:"${'$'}OPERIT_GID" /root 2>/dev/null || true; chmod 2775 /root 2>/dev/null || true; fi; eval "${'$'}COMMAND_TO_EXEC"'
         ret=${'$'}?
         if [ -n "${'$'}OPERIT_UID" ] && [ -n "${'$'}OPERIT_GID" ]; then
           for apt_path in /var/lib/apt/lists /var/cache/apt; do
@@ -1351,7 +1367,7 @@ EOF
         exit ${'$'}ret
         EOF
             chmod 700 "${'$'}CHROOT_WRAPPER" 2>/dev/null || true
-            exec su -c "sh \"${'$'}CHROOT_WRAPPER\" \"${'$'}BIN\" \"${'$'}UBUNTU_PATH\" \"${'$'}CMD_FILE\" \"${homeDir}\" \"${'$'}OPERIT_UID\" \"${'$'}OPERIT_GID\" \"${'$'}OPERIT_GROUPS\""
+            exec su -c "sh \"${'$'}CHROOT_WRAPPER\" \"${'$'}BIN\" \"${'$'}UBUNTU_PATH\" \"${'$'}CMD_FILE\" \"${homeDir}\" \"${'$'}OPERIT_UID\" \"${'$'}OPERIT_GID\" \"${'$'}OPERIT_GROUPS\" \"${'$'}INIT_FILE\""
           fi
           if ! resolve_proot_runtime; then
             return 1
@@ -1384,7 +1400,8 @@ $prootBindSetup
                 LANG=en_US.UTF-8 \
                 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
                 COMMAND_TO_EXEC="${'$'}COMMAND_TO_EXEC" \
-                /bin/bash -lc 'echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; eval "${'$'}COMMAND_TO_EXEC"'
+                OPERIT_LOCAL_SESSION_INIT="${'$'}OPERIT_LOCAL_SESSION_INIT" \
+                /bin/bash -lc 'eval "${'$'}OPERIT_LOCAL_SESSION_INIT" || exit ${'$'}?; echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; eval "${'$'}COMMAND_TO_EXEC"'
           else
             exec_proot_binary \
               -0 \
@@ -1397,7 +1414,8 @@ $prootBindSetup
                 LANG=en_US.UTF-8 \
                 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
                 COMMAND_TO_EXEC="${'$'}COMMAND_TO_EXEC" \
-                /bin/bash -lc 'echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; eval "${'$'}COMMAND_TO_EXEC"'
+                OPERIT_LOCAL_SESSION_INIT="${'$'}OPERIT_LOCAL_SESSION_INIT" \
+                /bin/bash -lc 'eval "${'$'}OPERIT_LOCAL_SESSION_INIT" || exit ${'$'}?; echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; eval "${'$'}COMMAND_TO_EXEC"'
           fi
         }
         """.trimIndent()
