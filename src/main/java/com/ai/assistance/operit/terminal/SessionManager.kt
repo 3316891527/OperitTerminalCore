@@ -26,7 +26,8 @@ class SessionManager(private val terminalManager: TerminalManager) {
      */
     fun createNewSession(
         title: String? = null,
-        terminalType: TerminalType
+        terminalType: TerminalType,
+        automation: Boolean = false,
     ): TerminalSessionData {
         lateinit var newSession: TerminalSessionData
         _state.update { currentState ->
@@ -38,7 +39,8 @@ class SessionManager(private val terminalManager: TerminalManager) {
             }
             newSession = TerminalSessionData(
                 title = title ?: defaultTitle,
-                terminalType = terminalType
+                terminalType = terminalType,
+                automation = automation,
             )
             currentState.copy(
                 sessions = currentState.sessions + newSession,
@@ -74,55 +76,51 @@ class SessionManager(private val terminalManager: TerminalManager) {
     /**
      * 关闭会话
      */
-    fun closeSession(sessionId: String) {
-        _state.update { currentState ->
-            val sessionToClose = currentState.sessions.find { it.id == sessionId }
-            
-            sessionToClose?.let { session ->
-                try {
-                    // 清理资源
-                    session.readJob?.cancel()
-                    session.sessionWriter?.close()
-                    terminalManager.closeTerminalSession(session.id)
-                } catch (e: Exception) {
-                    Log.e("SessionManager", "Error cleaning up session", e)
-                }
-            }
-            
-            val updatedSessions = currentState.sessions.filter { it.id != sessionId }
-            val newCurrentSessionId = if (currentState.currentSessionId == sessionId) {
-                updatedSessions.firstOrNull()?.id
-            } else {
-                currentState.currentSessionId
-            }
-            
-            currentState.copy(
-                sessions = updatedSessions,
-                currentSessionId = newCurrentSessionId
-            )
+    fun closeSession(sessionId: String): Boolean {
+        val existing = getSession(sessionId) ?: return false
+        val detached = synchronized(existing.commandLifecycle) {
+            val taken = takeSession(sessionId) ?: return false
+            terminalManager.finishClosedSession(taken)
+            taken
         }
-
+        // 先终止底层进程，再关闭流，避免向无响应进程刷写 writer 时阻塞关闭路径。
+        terminalManager.closeTerminalSession(sessionId)
+        detached.exitJob?.cancel()
+        detached.readJob?.cancel()
+        terminalManager.closeSessionWriter(detached)
         terminalManager.onSessionClosed(sessionId)
-        
-        Log.d("SessionManager", "Closed session: $sessionId")
+        return true
     }
-    
+
+    /** 状态更新函数可能重试，资源清理只能在成功取得关闭所有权之后执行。 */
+    private fun takeSession(sessionId: String): TerminalSessionData? {
+        while (true) {
+            val current = _state.value
+            val session = current.sessions.find { it.id == sessionId } ?: return null
+            val remaining = current.sessions.filterNot { it.id == sessionId }
+            val selected = if (current.currentSessionId == sessionId) remaining.firstOrNull()?.id
+                else current.currentSessionId
+            if (_state.compareAndSet(current, current.copy(sessions = remaining, currentSessionId = selected))) {
+                return session
+            }
+        }
+    }
+
     /**
      * 更新会话数据
      */
     fun updateSession(sessionId: String, updater: (TerminalSessionData) -> TerminalSessionData) {
-        _state.update { currentState ->
-            val updatedSessions = currentState.sessions.map { session ->
-                if (session.id == sessionId) {
-                    updater(session)
-                } else {
-                    session
-                }
+        val existing = getSession(sessionId) ?: return
+        synchronized(existing.commandLifecycle) {
+            if (existing.commandLifecycle.closed) return
+            _state.update { current ->
+                current.copy(sessions = current.sessions.map { session ->
+                    if (session.id == sessionId) updater(session) else session
+                })
             }
-            currentState.copy(sessions = updatedSessions)
         }
     }
-    
+
     /**
      * 保存会话的滚动位置
      */

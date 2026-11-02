@@ -28,7 +28,7 @@ class OutputProcessor(
     private val onCommandCompleted: (String) -> Unit = {}
 ) {
 
-    private val sessionStates = mutableMapOf<String, SessionProcessingState>()
+    private val sessionStates = java.util.concurrent.ConcurrentHashMap<String, SessionProcessingState>()
 
     companion object {
         private const val TAG = "OutputProcessor"
@@ -42,7 +42,36 @@ class OutputProcessor(
     /**
      * 处理终端输出
      */
-    fun processOutput(
+    fun processOutput(sessionId: String, chunk: String, sessionManager: SessionManager) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        synchronized(session.commandLifecycle) {
+            if (session.commandLifecycle.closed) return
+            processSessionOutput(sessionId, chunk, sessionManager)
+            val current = sessionManager.getSession(sessionId) ?: return
+            if (current.isFullscreen || current.rawBuffer.isNotEmpty() || chunk.contains('\r')) {
+                publishScreen(current)
+            }
+        }
+    }
+
+    private fun screenText(session: TerminalSessionData): String =
+        session.ansiParser.getScreenContent().map { row ->
+            row.joinToString("") { it.char.toString() }.trimEnd()
+        }.filterNot { it.contains(COMMAND_COMPLETION_MARKER_PREFIX) }
+            .joinToString("\n").trimEnd().takeLast(12_000)
+
+    private fun publishScreen(session: TerminalSessionData) {
+        val item = session.currentExecutingCommand ?: return
+        val screen = screenText(session)
+        if (screen == session.commandLifecycle.latestScreen) return
+        session.commandLifecycle.latestScreen = screen
+        onCommandExecutionEvent(CommandExecutionEvent(
+            commandId = item.id, sessionId = session.id, outputChunk = "", isCompleted = false,
+            screen = screen,
+        ))
+    }
+
+    private fun processSessionOutput(
         sessionId: String,
         chunk: String,
         sessionManager: SessionManager
@@ -657,7 +686,10 @@ class OutputProcessor(
                 sessionId = sessionId,
                 outputChunk = finalOutput,
                 isCompleted = true,
-                exitCode = exitCode
+                exitCode = exitCode,
+                terminationReason = if (session.commandLifecycle.cancellingCommandId == lastExecutingItem.id)
+                    "cancelled" else null,
+                screen = screenText(session),
             ))
 
             // Clear the reference since command is no longer executing
@@ -690,59 +722,57 @@ class OutputProcessor(
         sessionId: String,
         message: String,
         sessionManager: SessionManager,
-        exitCode: Int = -1
+        exitCode: Int = -1,
     ) {
-        sessionManager.updateSession(sessionId) {
-            it.copy(
-                isWaitingForInteractiveInput = false,
-                lastInteractivePrompt = "",
-                isInteractiveMode = false,
-                interactivePrompt = ""
-            )
-        }
-
         val session = sessionManager.getSession(sessionId) ?: return
-        session.rawBuffer.clear()
-        session.ansiParser.parse("\r\n$message\r\n")
-
-        val lastExecutingItem = session.currentExecutingCommand
-        if (lastExecutingItem != null && lastExecutingItem.isExecuting) {
-            val builder = session.currentCommandOutput
-            if (builder.isNotEmpty() && builder.last() != '\n') {
-                builder.append('\n')
-            }
-            builder.append(message)
-
-            val finalOutput = buildString {
-                if (lastExecutingItem.outputPages.isNotEmpty()) {
-                    append(lastExecutingItem.outputPages.joinToString("\n"))
-                }
-                val tail = builder.toString().trim()
-                if (tail.isNotEmpty()) {
-                    if (isNotEmpty()) append('\n')
-                    append(tail)
-                }
-            }.trim()
-
-            lastExecutingItem.setOutput(finalOutput)
-            lastExecutingItem.setExecuting(false)
-
-            onCommandExecutionEvent(
-                CommandExecutionEvent(
-                    commandId = lastExecutingItem.id,
-                    sessionId = sessionId,
-                    outputChunk = finalOutput,
-                    isCompleted = true,
-                    exitCode = exitCode
-                )
-            )
-
-            session.currentExecutingCommand = null
+        synchronized(session.commandLifecycle) {
+            finishClosedSession(session, message, exitCode.takeIf { it >= 0 })
         }
+    }
 
-        session.currentCommandOutput.clear()
-        session.currentOutputLineCount = 0
-        session.commandQueue.clear()
+    /** 显式关闭和 EOF 共用同一标志，脱离状态表后仍能完成全部等待方。 */
+    fun finishClosedSession(
+        session: TerminalSessionData,
+        message: String,
+        sessionExitCode: Int? = null,
+    ) {
+        synchronized(session.commandLifecycle) {
+            if (session.commandLifecycle.closed) return
+            session.commandLifecycle.closed = true
+            val tail = AnsiUtils.stripAnsi(session.rawBuffer.toString())
+            session.rawBuffer.clear()
+            session.ansiParser.parse("\r\n$message\r\n")
+            val running = session.currentExecutingCommand
+            if (running?.isExecuting == true) {
+                val output = buildString {
+                    if (running.outputPages.isNotEmpty()) append(running.outputPages.joinToString("\n"))
+                    val buffered = session.currentCommandOutput.toString() + tail
+                    if (buffered.isNotEmpty()) {
+                        if (isNotEmpty() && last() != '\n') append('\n')
+                        append(buffered)
+                    }
+                    if (isNotEmpty() && last() != '\n') append('\n')
+                    append(message)
+                }.trim()
+                running.setOutput(output)
+                running.setExecuting(false)
+                onCommandExecutionEvent(CommandExecutionEvent(
+                    commandId = running.id, sessionId = session.id, outputChunk = output, isCompleted = true,
+                    terminationReason = "session_closed", sessionExitCode = sessionExitCode,
+                    screen = screenText(session),
+                ))
+            }
+            session.commandQueue.forEach { queued ->
+                onCommandExecutionEvent(CommandExecutionEvent(
+                    commandId = queued.id, sessionId = session.id, outputChunk = "", isCompleted = true,
+                    terminationReason = "session_closed",
+                ))
+            }
+            session.currentExecutingCommand = null
+            session.currentCommandOutput.clear()
+            session.currentOutputLineCount = 0
+            session.commandQueue.clear()
+        }
     }
 
     /**

@@ -232,4 +232,5 @@
     <string name="terminal_accessibility_session_tab">会话“%1$s”</string>
     <string name="terminal_accessibility_current_session_tab">当前会话“%1$s”</string>
     <string name="terminal_accessibility_close_session_tab">关闭会话“%1$s”</string>
+    <string name="terminal_session_closed">终端会话已关闭</string>
 </resources> 

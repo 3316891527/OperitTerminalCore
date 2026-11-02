@@ -82,11 +82,21 @@ class LocalTerminalProvider(
         hiddenExecScope.cancel()
     }
 
-    override suspend fun startSession(sessionId: String): Result<Pair<TerminalSession, Pty>> {
+    override suspend fun startSession(sessionId: String): Result<Pair<TerminalSession, Pty>> =
+        startLocalSession(sessionId, automation = false)
+
+    suspend fun startAutomationSession(sessionId: String): Result<Pair<TerminalSession, Pty>> =
+        startLocalSession(sessionId, automation = true)
+
+    private suspend fun startLocalSession(sessionId: String, automation: Boolean): Result<Pair<TerminalSession, Pty>> {
         return withContext(Dispatchers.IO) {
             try {
                 val command = buildVisibleSessionCommand()
-                val env = buildEnvironment()
+                // 本地自动化会话关闭分页与 Git 交互提示，人工终端维持原有环境。
+                val automationEnvironment = if (automation) mapOf(
+                    "OPERIT_AUTOMATION" to "1", "PAGER" to "cat", "GIT_PAGER" to "cat", "GIT_TERMINAL_PROMPT" to "0",
+                ) else emptyMap()
+                val env = buildEnvironment() + automationEnvironment
 
                 Log.d(TAG, "Starting local terminal session with command: ${command.joinToString(" ")}")
                 Log.d(TAG, "Environment: $env")

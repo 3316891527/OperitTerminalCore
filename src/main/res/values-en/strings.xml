@@ -232,4 +232,5 @@
     <string name="terminal_accessibility_session_tab">Session "%1$s"</string>
     <string name="terminal_accessibility_current_session_tab">Current session "%1$s"</string>
     <string name="terminal_accessibility_close_session_tab">Close session "%1$s"</string>
+    <string name="terminal_session_closed">Terminal session closed</string>
 </resources> 
