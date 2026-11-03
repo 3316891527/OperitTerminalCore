@@ -3,6 +3,7 @@ package com.ai.assistance.operit.terminal
 import android.content.Context
 import android.system.Os
 import com.ai.assistance.operit.terminal.command.CommandCancellationOutcome
+import com.ai.assistance.operit.terminal.command.CommandCancellationRecovery
 import com.ai.assistance.operit.terminal.process.awaitTerminalExit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -62,7 +63,12 @@ class TerminalManager private constructor(
 ) {
     internal val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val commandEventChannel = Channel<CommandExecutionEvent>(Channel.UNLIMITED)
-    private data class PendingInput(val text: String, val commandId: String? = null)
+    private data class PendingInput(
+        val text: String,
+        val commandId: String? = null,
+        val recovery: CommandCancellationRecovery? = null,
+        val recoveryProbe: Boolean = false,
+    )
     private val sessionInputs = ConcurrentHashMap<String, Channel<PendingInput>>()
     private val inputJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
     private val sessionPtys = ConcurrentHashMap<String, Pty>()
@@ -97,6 +103,7 @@ class TerminalManager private constructor(
                 _directoryChangeEvents.emit(event)
             }
         },
+        onShellPrompt = { sessionId -> enqueueCancellationProbe(sessionId) },
         onCommandCompleted = { sessionId ->
             coroutineScope.launch {
                 processNextQueuedCommand(sessionId)
@@ -346,7 +353,9 @@ class TerminalManager private constructor(
                     command == null || command.id != commandId || !command.isExecuting) false
                 else {
                     current.commandLifecycle.cancellingCommandId = commandId
-                    enqueueInput(current, "\u0003", commandId)
+                    val recovery = CommandCancellationRecovery(commandId)
+                    current.commandLifecycle.cancellationRecovery = recovery
+                    enqueueInput(current, "\u0003", commandId, recovery)
                     true
                 }
             }
@@ -362,9 +371,15 @@ class TerminalManager private constructor(
                 }
                 true
             } == true
-            if (settled) {
+            // 限时结束与完成事件可能同时到达，退役前在同一监视器内复查。
+            val finished = synchronized(original.commandLifecycle) {
+                val current = sessionManager.getSession(sessionId)?.currentExecutingCommand
+                current == null || current.id != commandId || !current.isExecuting
+            }
+            if (settled || finished) {
                 synchronized(original.commandLifecycle) {
                     original.commandLifecycle.cancellingCommandId = null
+                    original.commandLifecycle.cancellationRecovery = null
                 }
                 processNextQueuedCommand(sessionId)
                 if (original.commandLifecycle.closed) {
@@ -554,8 +569,18 @@ class TerminalManager private constructor(
                 for (input in inputs) {
                     val session = sessionManager.getSession(sessionId) ?: break
                     val accepted = synchronized(session.commandLifecycle) {
-                        !session.commandLifecycle.closed && (input.commandId == null ||
-                            session.currentExecutingCommand?.id == input.commandId)
+                        if (session.commandLifecycle.closed || (input.commandId != null &&
+                                session.currentExecutingCommand?.id != input.commandId)) {
+                            false
+                        } else if (input.recovery != null) {
+                            if (session.commandLifecycle.cancellationRecovery !== input.recovery) false
+                            else {
+                                // 写操作仍在锁外；先标记发送阶段，避免漏掉紧随中断到来的提示符。
+                                if (input.recoveryProbe) input.recovery.onProbeDispatched()
+                                else input.recovery.onInterruptDispatched()
+                                true
+                            }
+                        } else true
                     }
                     if (!accepted) continue
                     try {
@@ -579,8 +604,30 @@ class TerminalManager private constructor(
         job.start()
     }
 
-    private fun enqueueInput(session: TerminalSessionData, text: String, commandId: String? = null): Boolean =
-        sessionInputs[session.id]?.trySend(PendingInput(text, commandId))?.isSuccess == true
+    private fun enqueueInput(
+        session: TerminalSessionData,
+        text: String,
+        commandId: String? = null,
+        recovery: CommandCancellationRecovery? = null,
+        recoveryProbe: Boolean = false,
+    ): Boolean = sessionInputs[session.id]?.trySend(
+        PendingInput(text, commandId, recovery, recoveryProbe),
+    )?.isSuccess == true
+
+    /** 提示符只触发验证，不直接结束命令；令牌回复才证明 shell 已重新处理输入。 */
+    private fun enqueueCancellationProbe(sessionId: String) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        synchronized(session.commandLifecycle) {
+            val recovery = session.commandLifecycle.cancellationRecovery ?: return
+            if (session.commandLifecycle.closed || session.terminalType != TerminalType.LOCAL ||
+                session.currentExecutingCommand?.id != recovery.commandId ||
+                session.currentExecutingCommand?.isExecuting != true ||
+                !recovery.queueProbeAfterPrompt()) return
+            if (!enqueueInput(session, recovery.probeInput, recovery.commandId, recovery, recoveryProbe = true)) {
+                sessionManager.closeSession(sessionId)
+            }
+        }
+    }
 
     private fun buildCommandInput(command: String, commandId: String): String {
         val normalizedCommand = command.trimEnd('\r', '\n')

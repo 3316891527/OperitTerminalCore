@@ -6,6 +6,7 @@ import kotlinx.coroutines.sync.Mutex
 class CommandLifecycle {
     @Volatile var closed = false
     var cancellingCommandId: String? = null
+    internal var cancellationRecovery: CommandCancellationRecovery? = null
     val cancellationMutex = Mutex()
     var latestScreen: String? = null
 }
