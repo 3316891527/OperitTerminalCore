@@ -1,6 +1,10 @@
 package com.ai.assistance.operit.terminal
 
 import android.system.Os
+import android.system.ErrnoException
+import com.ai.assistance.operit.terminal.process.SessionProcessIdentity
+import com.ai.assistance.operit.terminal.process.readSessionProcess
+import com.ai.assistance.operit.terminal.process.terminatePtySession
 import android.system.OsConstants
 import android.util.Log
 import java.io.File
@@ -11,6 +15,11 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 
+internal fun ptyProcessExitValue(alive: Boolean): Int {
+    if (alive) throw IllegalThreadStateException("Process hasn't exited")
+    return -1
+}
+
 open class Pty(
     val process: Process,
     val masterFd: FileDescriptor?,
@@ -20,6 +29,12 @@ open class Pty(
     /** 子进程 pid；JNI createSubprocess 已返回该值。无法取得 pid 的实现（如远程会话）为 -1。 */
     val pid: Int = -1
 ) {
+    private var sessionOwner: SessionProcessIdentity? = null
+
+    /** 退役整个本地会话；远程会话不提供本地进程所有权保证。 */
+    suspend fun terminateSession(timeoutMs: Long): Boolean =
+        sessionOwner?.let { terminatePtySession(it, timeoutMs) } == true
+
     // 为本地终端提供的便利构造函数
     constructor(process: Process, masterFd: FileDescriptor, ptyMaster: Int) : this(
         process = process,
@@ -71,34 +86,49 @@ open class Pty(
 
             val fileDescriptor = Reflect.getFileDescriptor(masterFdInt)
             
-            // We need a Process object to manage the subprocess lifetime
+            val ownerIdentity = readSessionProcess(pid)?.copy(sessionId = pid)
+
+            // 缓存回收结果，所有进程判断和关闭操作均核对原始进程身份。
             val dummyProcess = object : Process() {
+                @Volatile private var reapedExitCode: Int? = null
+
                 override fun destroy() {
-                    // Negative pid targets the whole process group created by forkpty/setsid.
-                    runCatching { Os.kill(-pid, OsConstants.SIGHUP) }
-                    runCatching { Os.kill(-pid, OsConstants.SIGTERM) }
-                    runCatching { android.os.Process.sendSignal(pid, 1) }
-                    try {
-                        Thread.sleep(80)
-                    } catch (_: InterruptedException) {
+                    val owner = ownerIdentity ?: return
+                    fun signalOwned(signal: Int) {
+                        val current = readSessionProcess(pid) ?: return
+                        if (current.startTime != owner.startTime) return
+                        // 保留个人版本的进程组清理，并防止 PID 复用后误杀无关进程。
+                        if (current.sessionId == pid) runCatching { Os.kill(-pid, signal) }
+                        runCatching { Os.kill(pid, signal) }
                     }
-                    runCatching { Os.kill(-pid, OsConstants.SIGKILL) }
-                    runCatching { android.os.Process.sendSignal(pid, 9) }
+                    signalOwned(OsConstants.SIGHUP)
+                    signalOwned(OsConstants.SIGTERM)
+                    try {
+                        Thread.sleep(80L)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    signalOwned(OsConstants.SIGKILL)
                 }
 
                 override fun exitValue(): Int {
-                    // Process.isAlive() relies on exitValue() throwing while the process runs.
-                    // Do not catch the deliberate IllegalThreadStateException.
-                    return try {
-                        // Os.kill 会报告进程不存在，供 Process.isAlive 判断存活状态。
-                        Os.kill(pid, 0)
-                        throw IllegalThreadStateException("Process hasn't exited")
-                    } catch (e: IllegalThreadStateException) {
-                        throw e
-                    } catch (_: Exception) {
-                        // The actual exit code requires a blocking waitpid call.
-                        0
+                    reapedExitCode?.let { return it }
+                    val current = readSessionProcess(pid)
+                    if (ownerIdentity != null && current != null) {
+                        if (current.startTime != ownerIdentity.startTime) {
+                            reapedExitCode = -1
+                            return -1
+                        }
+                        if (current.state == "Z" || current.state == "X") return waitFor()
                     }
+                    val alive = try {
+                        Os.kill(pid, 0)
+                        true
+                    } catch (error: ErrnoException) {
+                        // 只有 ESRCH 确认进程消失，权限或临时探测错误不能解释为成功退出。
+                        error.errno != OsConstants.ESRCH
+                    }
+                    return ptyProcessExitValue(alive)
                 }
 
                 override fun getErrorStream(): InputStream? = null
@@ -106,11 +136,19 @@ open class Pty(
                 override fun getOutputStream(): OutputStream? = null
 
                 override fun waitFor(): Int {
-                    return Companion.waitFor(pid)
+                    return synchronized(this) {
+                        reapedExitCode ?: run {
+                            val current = readSessionProcess(pid)
+                            if (ownerIdentity != null && current != null && current.startTime != ownerIdentity.startTime) -1
+                            else Companion.waitFor(pid)
+                        }.also { reapedExitCode = it }
+                    }
                 }
             }
             
-            return Pty(dummyProcess, fileDescriptor, masterFdInt, stdout = FileInputStream(fileDescriptor), stdin = FileOutputStream(fileDescriptor), pid = pid)
+            return Pty(dummyProcess, fileDescriptor, masterFdInt,
+                stdout = FileInputStream(fileDescriptor), stdin = FileOutputStream(fileDescriptor), pid = pid,
+            ).also { it.sessionOwner = ownerIdentity }
         }
 
         private external fun createSubprocess(cmdArray: Array<String>, envArray: Array<String>, workingDir: String): IntArray

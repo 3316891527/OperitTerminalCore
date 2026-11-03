@@ -4,6 +4,7 @@ import android.util.Log
 import com.ai.assistance.operit.terminal.CommandExecutionEvent
 import com.ai.assistance.operit.terminal.SessionDirectoryEvent
 import com.ai.assistance.operit.terminal.SessionManager
+import com.ai.assistance.operit.terminal.command.CommandCancellationRecovery
 import com.ai.assistance.operit.terminal.data.SessionInitState
 import com.ai.assistance.operit.terminal.data.TerminalSessionData
 import com.ai.assistance.operit.terminal.view.domain.ansi.AnsiUtils
@@ -25,10 +26,11 @@ private data class SessionProcessingState(
 class OutputProcessor(
     private val onCommandExecutionEvent: (CommandExecutionEvent) -> Unit = {},
     private val onDirectoryChangeEvent: (SessionDirectoryEvent) -> Unit = {},
-    private val onCommandCompleted: (String) -> Unit = {}
+    private val onCommandCompleted: (String) -> Unit = {},
+    private val onShellPrompt: (String) -> Unit = {},
 ) {
 
-    private val sessionStates = mutableMapOf<String, SessionProcessingState>()
+    private val sessionStates = java.util.concurrent.ConcurrentHashMap<String, SessionProcessingState>()
 
     companion object {
         private const val TAG = "OutputProcessor"
@@ -42,7 +44,38 @@ class OutputProcessor(
     /**
      * 处理终端输出
      */
-    fun processOutput(
+    fun processOutput(sessionId: String, chunk: String, sessionManager: SessionManager) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        synchronized(session.commandLifecycle) {
+            if (session.commandLifecycle.closed) return
+            processSessionOutput(sessionId, chunk, sessionManager)
+            val current = sessionManager.getSession(sessionId) ?: return
+            if (current.isFullscreen || current.rawBuffer.isNotEmpty() || chunk.contains('\r')) {
+                publishScreen(current)
+            }
+        }
+    }
+
+    private fun screenText(session: TerminalSessionData): String =
+        session.ansiParser.getScreenContent().map { row ->
+            row.joinToString("") { it.char.toString() }.trimEnd()
+        }.filterNot {
+            it.contains(COMMAND_COMPLETION_MARKER_PREFIX) || it.contains(CommandCancellationRecovery.PROTOCOL_NAME)
+        }
+            .joinToString("\n").trimEnd().takeLast(12_000)
+
+    private fun publishScreen(session: TerminalSessionData) {
+        val item = session.currentExecutingCommand ?: return
+        val screen = screenText(session)
+        if (screen == session.commandLifecycle.latestScreen) return
+        session.commandLifecycle.latestScreen = screen
+        onCommandExecutionEvent(CommandExecutionEvent(
+            commandId = item.id, sessionId = session.id, outputChunk = "", isCompleted = false,
+            screen = screen,
+        ))
+    }
+
+    private fun processSessionOutput(
         sessionId: String,
         chunk: String,
         sessionManager: SessionManager
@@ -53,6 +86,10 @@ class OutputProcessor(
             when (part) {
                 is ShellPromptStream.Part.Output -> processTerminalOutput(sessionId, part.text, sessionManager)
                 is ShellPromptStream.Part.Prompt -> handleShellPrompt(sessionId, part.directory, sessionManager)
+                is ShellPromptStream.Part.CancellationAcknowledgement -> {
+                    val session = sessionManager.getSession(sessionId) ?: return
+                    finishCancellationRecovery(session, part.token)
+                }
             }
         }
     }
@@ -166,6 +203,7 @@ class OutputProcessor(
 
     private fun handleCarriageReturn(sessionId: String, line: String, sessionManager: SessionManager) {
         val cleanLine = AnsiUtils.stripAnsi(line)
+        if (cleanLine.contains(CommandCancellationRecovery.PROTOCOL_NAME)) return
         val session = sessionManager.getSession(sessionId) ?: return
         if (session.initState != SessionInitState.READY) {
             processLine(sessionId, line, sessionManager)
@@ -196,6 +234,7 @@ class OutputProcessor(
         sessionManager: SessionManager
     ) {
         val session = sessionManager.getSession(sessionId) ?: return
+        if (line.contains(CommandCancellationRecovery.PROTOCOL_NAME)) return
 
         when (session.initState) {
             SessionInitState.INITIALIZING -> {
@@ -620,7 +659,7 @@ class OutputProcessor(
     private fun finishCurrentCommand(
         sessionId: String,
         sessionManager: SessionManager,
-        exitCode: Int = 0
+        exitCode: Int? = 0
     ) {
         sessionManager.updateSession(sessionId) { session ->
             session.copy(
@@ -632,8 +671,26 @@ class OutputProcessor(
         }
 
         val session = sessionManager.getSession(sessionId) ?: return
-        val lastExecutingItem = session.currentExecutingCommand
+        finishExecutingCommand(session, exitCode)
+    }
 
+    /** 只完成仍被当前取消请求持有的命令；恢复确认不伪造原命令退出码。 */
+    internal fun finishCancellationRecovery(session: TerminalSessionData, token: String): Boolean {
+        synchronized(session.commandLifecycle) {
+            val lifecycle = session.commandLifecycle
+            val recovery = lifecycle.cancellationRecovery ?: return false
+            val current = session.currentExecutingCommand ?: return false
+            if (lifecycle.closed || lifecycle.cancellingCommandId != current.id ||
+                recovery.commandId != current.id || !current.isExecuting ||
+                !recovery.acceptsAcknowledgement(token)) return false
+            finishExecutingCommand(session, exitCode = null)
+            return true
+        }
+    }
+
+    private fun finishExecutingCommand(session: TerminalSessionData, exitCode: Int?) {
+        val sessionId = session.id
+        val lastExecutingItem = session.currentExecutingCommand
         if (lastExecutingItem != null && lastExecutingItem.isExecuting) {
             val finalOutput = buildString {
                 if (lastExecutingItem.outputPages.isNotEmpty()) {
@@ -657,7 +714,10 @@ class OutputProcessor(
                 sessionId = sessionId,
                 outputChunk = finalOutput,
                 isCompleted = true,
-                exitCode = exitCode
+                exitCode = exitCode,
+                terminationReason = if (session.commandLifecycle.cancellingCommandId == lastExecutingItem.id)
+                    "cancelled" else null,
+                screen = screenText(session),
             ))
 
             // Clear the reference since command is no longer executing
@@ -690,59 +750,58 @@ class OutputProcessor(
         sessionId: String,
         message: String,
         sessionManager: SessionManager,
-        exitCode: Int = -1
+        exitCode: Int = -1,
     ) {
-        sessionManager.updateSession(sessionId) {
-            it.copy(
-                isWaitingForInteractiveInput = false,
-                lastInteractivePrompt = "",
-                isInteractiveMode = false,
-                interactivePrompt = ""
-            )
-        }
-
         val session = sessionManager.getSession(sessionId) ?: return
-        session.rawBuffer.clear()
-        session.ansiParser.parse("\r\n$message\r\n")
-
-        val lastExecutingItem = session.currentExecutingCommand
-        if (lastExecutingItem != null && lastExecutingItem.isExecuting) {
-            val builder = session.currentCommandOutput
-            if (builder.isNotEmpty() && builder.last() != '\n') {
-                builder.append('\n')
-            }
-            builder.append(message)
-
-            val finalOutput = buildString {
-                if (lastExecutingItem.outputPages.isNotEmpty()) {
-                    append(lastExecutingItem.outputPages.joinToString("\n"))
-                }
-                val tail = builder.toString().trim()
-                if (tail.isNotEmpty()) {
-                    if (isNotEmpty()) append('\n')
-                    append(tail)
-                }
-            }.trim()
-
-            lastExecutingItem.setOutput(finalOutput)
-            lastExecutingItem.setExecuting(false)
-
-            onCommandExecutionEvent(
-                CommandExecutionEvent(
-                    commandId = lastExecutingItem.id,
-                    sessionId = sessionId,
-                    outputChunk = finalOutput,
-                    isCompleted = true,
-                    exitCode = exitCode
-                )
-            )
-
-            session.currentExecutingCommand = null
+        synchronized(session.commandLifecycle) {
+            finishClosedSession(session, message, exitCode.takeIf { it >= 0 })
         }
+    }
 
-        session.currentCommandOutput.clear()
-        session.currentOutputLineCount = 0
-        session.commandQueue.clear()
+    /** 显式关闭和 EOF 共用同一标志，脱离状态表后仍能完成全部等待方。 */
+    fun finishClosedSession(
+        session: TerminalSessionData,
+        message: String,
+        sessionExitCode: Int? = null,
+    ) {
+        synchronized(session.commandLifecycle) {
+            if (session.commandLifecycle.closed) return
+            session.commandLifecycle.closed = true
+            val tail = AnsiUtils.stripAnsi(session.rawBuffer.toString())
+            session.rawBuffer.clear()
+            session.ansiParser.parse("\r\n$message\r\n")
+            val running = session.currentExecutingCommand
+            if (running?.isExecuting == true) {
+                val output = buildString {
+                    if (running.outputPages.isNotEmpty()) append(running.outputPages.joinToString("\n"))
+                    val buffered = session.currentCommandOutput.toString() + tail
+                    if (buffered.isNotEmpty()) {
+                        if (isNotEmpty() && last() != '\n') append('\n')
+                        append(buffered)
+                    }
+                    if (isNotEmpty() && last() != '\n') append('\n')
+                    append(message)
+                }.trim()
+                running.setOutput(output)
+                running.setExecuting(false)
+                onCommandExecutionEvent(CommandExecutionEvent(
+                    commandId = running.id, sessionId = session.id, outputChunk = output, isCompleted = true,
+                    terminationReason = "session_closed", sessionExitCode = sessionExitCode,
+                    screen = screenText(session),
+                ))
+            }
+            session.commandQueue.forEach { queued ->
+                onCommandExecutionEvent(CommandExecutionEvent(
+                    commandId = queued.id, sessionId = session.id, outputChunk = "", isCompleted = true,
+                    terminationReason = "session_closed",
+                ))
+            }
+            session.currentExecutingCommand = null
+            session.currentCommandOutput.clear()
+            session.currentOutputLineCount = 0
+            session.commandQueue.clear()
+            session.commandLifecycle.cancellationRecovery = null
+        }
     }
 
     /**
@@ -822,6 +881,7 @@ class OutputProcessor(
             )
         }
         onDirectoryChangeEvent(SessionDirectoryEvent(sessionId, currentDirectory))
-        // 本地命令以原唯一完成标记结束，不在两条注入命令之间的提示符处提前结束。
+        // 提示符本身不结束运行命令，取消期间仅用来触发带令牌的 shell 确认。
+        onShellPrompt(sessionId)
     }
 }
