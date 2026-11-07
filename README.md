@@ -42,3 +42,8 @@ This module can be integrated as a Git Submodule. The client application can eit
 ## 宿主本地会话初始化
 
 [本地会话初始化钩子](docs/local_session_initializer.md) 说明在登录就绪之前安装小型命令资源的接入方式。
+
+
+## Terminal protocol responses
+
+[Terminal protocol responses](docs/terminal_protocol_responses.md) documents status and cursor-position reports, session routing, and interactive prompt behavior.

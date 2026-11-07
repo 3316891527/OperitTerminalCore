@@ -28,6 +28,7 @@ class OutputProcessor(
     private val onDirectoryChangeEvent: (SessionDirectoryEvent) -> Unit = {},
     private val onCommandCompleted: (String) -> Unit = {},
     private val onShellPrompt: (String) -> Unit = {},
+    private val onTerminalResponse: (sessionId: String, response: String) -> Unit = { _, _ -> },
 ) {
 
     private val sessionStates = java.util.concurrent.ConcurrentHashMap<String, SessionProcessingState>()
@@ -94,6 +95,13 @@ class OutputProcessor(
         }
     }
 
+    /** Route replies to the source session even while another session is selected. */
+    internal fun processAnsiOutput(session: TerminalSessionData, chunk: String) {
+        session.ansiParser.parseWithResponses(chunk).forEach { response ->
+            onTerminalResponse(session.id, response)
+        }
+    }
+
     private fun processTerminalOutput(
         sessionId: String,
         chunk: String,
@@ -110,7 +118,7 @@ class OutputProcessor(
         Log.d(TAG, "Processing chunk for session $sessionId. New buffer size: ${session.rawBuffer.length}")
 
         // 先将整个数据块交给渲染器，不能因模式切换丢掉进入、退出或选项内容。
-        session.ansiParser.parse(chunk)
+        processAnsiOutput(session, chunk)
         detectFullscreenMode(sessionId, session.rawBuffer, sessionManager)
         
         // 如果在全屏模式下，跳过行解析逻辑（全屏应用自己管理屏幕）

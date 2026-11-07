@@ -110,13 +110,22 @@ class AnsiTerminalEmulator(
      * 解析并执行 ANSI 序列
      */
     fun parse(text: String) {
+        parseWithResponses(text)
+    }
+
+    /**
+     * Parse output and collect terminal protocol replies in sequence order.
+     * Coordinates are captured at each query, before later output moves the cursor.
+     */
+    fun parseWithResponses(text: String): List<String> {
+        val responses = mutableListOf<String>()
         val scanner = AnsiScanner(pendingAnsiInput + text, requireComplete = true)
         pendingAnsiInput = ""
         while (scanner.hasNext()) {
             when (val seq = scanner.scanNext()) {
                 is AnsiSequence.Text -> handleText(seq.char)
                 is AnsiSequence.ControlChar -> handleControlChar(seq)
-                is AnsiSequence.CSI -> handleCSI(seq)
+                is AnsiSequence.CSI -> handleCSI(seq, responses)
                 is AnsiSequence.OSC -> handleOSC(seq)
                 is AnsiSequence.SingleEscape -> handleSingleEscape(seq)
                 is AnsiSequence.DCS -> handleDCS(seq)
@@ -132,6 +141,7 @@ class AnsiTerminalEmulator(
         notifyChange()
         // 通知新输出监听器
         notifyNewOutput()
+        return responses
     }
     
     /**
@@ -216,7 +226,7 @@ class AnsiTerminalEmulator(
     /**
      * 处理 CSI 序列
      */
-    private fun handleCSI(csi: AnsiSequence.CSI) {
+    private fun handleCSI(csi: AnsiSequence.CSI, responses: MutableList<String>) {
         val params = csi.params
         val p1 = params.firstOrNull() ?: 0
         
@@ -305,6 +315,9 @@ class AnsiTerminalEmulator(
             'P' -> deleteChars(p1.coerceAtLeast(1)) // DCH - Delete Characters
             'X' -> eraseChars(p1.coerceAtLeast(1)) // ECH - Erase Characters
             
+            // DSR replies are protocol input, not visible text or a shell command.
+            'n' -> handleDeviceStatusReport(csi, responses)
+
             // 文本属性
             'm' -> handleSGR(params)
             
@@ -322,6 +335,28 @@ class AnsiTerminalEmulator(
         }
     }
     
+    private fun handleDeviceStatusReport(
+        csi: AnsiSequence.CSI,
+        responses: MutableList<String>,
+    ) {
+        if (csi.intermediates.isNotEmpty() || csi.params.size != 1) return
+        when (csi.params.single()) {
+            5 -> if (!csi.private) responses += "\u001b[0n"
+            6 -> {
+                // A pending autowrap can leave cursorX == screenWidth; CPR still
+                // reports the last column until the next printable character wraps.
+                val column = cursorX.coerceIn(0, screenWidth - 1) + 1
+                val row = if (originMode) {
+                    (cursorY - scrollTop).coerceIn(0, scrollBottom - scrollTop) + 1
+                } else {
+                    cursorY.coerceIn(0, screenHeight - 1) + 1
+                }
+                val prefix = if (csi.private) "?" else ""
+                responses += "\u001b[$prefix$row;${column}R"
+            }
+        }
+    }
+
     /**
      * 处理 SGR (Select Graphic Rendition) - 文本属性设置
      */

@@ -68,6 +68,7 @@ class TerminalManager private constructor(
         val commandId: String? = null,
         val recovery: CommandCancellationRecovery? = null,
         val recoveryProbe: Boolean = false,
+        val terminalResponse: Boolean = false,
     )
     private val sessionInputs = ConcurrentHashMap<String, Channel<PendingInput>>()
     private val inputJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
@@ -104,6 +105,7 @@ class TerminalManager private constructor(
             }
         },
         onShellPrompt = { sessionId -> enqueueCancellationProbe(sessionId) },
+        onTerminalResponse = { sessionId, response -> enqueueTerminalResponse(sessionId, response) },
         onCommandCompleted = { sessionId ->
             coroutineScope.launch {
                 processNextQueuedCommand(sessionId)
@@ -585,7 +587,7 @@ class TerminalManager private constructor(
                     if (!accepted) continue
                     try {
                         writeInputToKernel(session, input.text, "session-input")
-                        if (session.isWaitingForInteractiveInput) {
+                        if (!input.terminalResponse && session.isWaitingForInteractiveInput) {
                             sessionManager.updateSession(sessionId) { it.copy(isWaitingForInteractiveInput = false) }
                         }
                     } catch (error: Exception) {
@@ -610,9 +612,18 @@ class TerminalManager private constructor(
         commandId: String? = null,
         recovery: CommandCancellationRecovery? = null,
         recoveryProbe: Boolean = false,
+        terminalResponse: Boolean = false,
     ): Boolean = sessionInputs[session.id]?.trySend(
-        PendingInput(text, commandId, recovery, recoveryProbe),
+        PendingInput(text, commandId, recovery, recoveryProbe, terminalResponse),
     )?.isSuccess == true
+
+    /** Protocol replies use the session writer without changing the pending user prompt. */
+    private fun enqueueTerminalResponse(sessionId: String, response: String) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        if (!enqueueInput(session, response, terminalResponse = true)) {
+            Log.w(TAG, "Terminal response queue is closed for session $sessionId")
+        }
+    }
 
     /** 提示符只触发验证，不直接结束命令；令牌回复才证明 shell 已重新处理输入。 */
     private fun enqueueCancellationProbe(sessionId: String) {
